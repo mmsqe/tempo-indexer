@@ -1,0 +1,17 @@
+[package]
+name = "tx-index"
+description = "A secondary index from address and type to chain position, for nodes that store transactions by hash"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The whole dependency surface, deliberately. Nothing node-specific: consumers pin
+# their own node framework, and anything shaped like one here would have to pick a
+# version for them.
+alloy-primitives = { version = "1.6.1", default-features = false }
+rocksdb = "0.24"
+eyre = "0.6.12"
+
+[dev-dependencies]
+tempfile = "3.24.0"
