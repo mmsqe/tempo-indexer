@@ -57,6 +57,11 @@ let page = reader.query(&filter, after, tx_index::Order::Descending, 100)?;
 `Store` is the writing half and does not clone, so "sole writer" is the type system's
 problem; every read goes through `Reader`.
 
+`Reader::page` wraps `query` with the paging rules — the limit clamped at both ends, a
+look-ahead row to decide whether another page exists, and a cursor cut from the last row
+*returned*. Each is a way to silently truncate a walk, so they live here rather than in
+each caller.
+
 ## Tests
 
 `cargo test` — 21 tests over the keyspace layout, cursor round-tripping, filter

@@ -345,6 +345,64 @@ impl Reader {
     }
 }
 
+/// Page size when the caller names none, and the ceiling on one that does.
+///
+/// Not arbitrary: `eth_getTransactions` publishes them — its `PaginationParams::limit`
+/// documents "Defaults to 10. Maximum is 100". The ceiling is also what stops one
+/// request asking a node to serialize the world.
+pub const DEFAULT_LIMIT: usize = 10;
+pub const MAX_LIMIT: usize = 100;
+
+/// A page of the index; `next_cursor` is `None` on the last one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page {
+    pub rows: Vec<IndexedTx>,
+    pub next_cursor: Option<String>,
+}
+
+impl Reader {
+    /// One page of the index, with the cursor to continue from.
+    ///
+    /// The rules live here rather than in each caller because each is a way to
+    /// truncate a walk without saying so:
+    ///
+    /// - `limit` clamps at both ends. A zero-row page has no last row to cut a
+    ///   cursor from, so the caller hears the walk is over while rows remain.
+    /// - One row *past* the limit decides whether another page exists. Counting
+    ///   instead promises a next page that turns out empty whenever the total is an
+    ///   exact multiple of the limit.
+    /// - The cursor names the last row **returned**, never the one peeked at, or the
+    ///   next page skips it.
+    /// - A cursor this did not issue is an error, not an empty page, or a caller
+    ///   replaying a stale one reads silence as the end.
+    pub fn page(
+        &self,
+        filter: &Filter,
+        cursor: Option<&str>,
+        order: Order,
+        limit: Option<usize>,
+    ) -> eyre::Result<Page> {
+        let after = match cursor {
+            Some(cursor) => Some(
+                Position::decode(cursor)
+                    .ok_or_else(|| eyre::eyre!("malformed cursor: {cursor}"))?,
+            ),
+            None => None,
+        };
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+        let mut rows = self.query(filter, after, order, limit.saturating_add(1))?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_cursor = rows
+            .last()
+            .filter(|_| has_more)
+            .map(|row| row.position.encode());
+
+        Ok(Page { rows, next_cursor })
+    }
+}
+
 type Cfs<'a> = (
     &'a ColumnFamily,
     &'a ColumnFamily,
@@ -902,5 +960,88 @@ mod tests {
             .query(&Filter::default(), None, Order::Ascending, 10)
             .is_err());
         assert!(store.indexed_tip().is_err());
+    }
+    #[test]
+    fn a_page_stops_at_the_limit_and_says_where_to_resume() {
+        let (_dir, store) = seeded();
+        let page = store
+            .reader()
+            .page(&Filter::default(), None, Order::Ascending, Some(2))
+            .unwrap();
+        assert_eq!(page.rows.len(), 2);
+        // The cursor names the last row returned, not the row peeked at to learn
+        // there was more -- resuming from the peeked one would skip it.
+        assert_eq!(page.next_cursor, Some(page.rows[1].position.encode()));
+    }
+
+    #[test]
+    fn the_last_page_reports_no_cursor() {
+        // Exactly as many rows as the limit, so the look-ahead comes back empty. A
+        // page sized from a count would hand back a cursor onto nothing here, and
+        // every caller would pay one empty round trip to discover the end.
+        let (_dir, store) = seeded();
+        let page = store
+            .reader()
+            .page(&Filter::default(), None, Order::Ascending, Some(4))
+            .unwrap();
+        assert_eq!(page.rows.len(), 4);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn paging_by_cursor_covers_every_row_once() {
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        for order in [Order::Ascending, Order::Descending] {
+            let all = reader
+                .page(&Filter::default(), None, order, Some(100))
+                .unwrap();
+            let (mut seen, mut cursor) = (Vec::new(), None);
+            // Bounded: a cursor that fails to advance would otherwise hang rather
+            // than fail, which is the harder of the two to read.
+            for _ in 0..=all.rows.len() {
+                let page = reader
+                    .page(&Filter::default(), cursor.as_deref(), order, Some(1))
+                    .unwrap();
+                seen.extend(page.rows);
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert!(cursor.is_none(), "the cursor never ran out ({order:?})");
+            assert_eq!(seen, all.rows, "paged result diverged ({order:?})");
+        }
+    }
+
+    #[test]
+    fn limit_clamps_at_both_ends() {
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        let page = |limit| {
+            reader
+                .page(&Filter::default(), None, Order::Ascending, limit)
+                .unwrap()
+        };
+        // Zero would leave no last row to cut a cursor from, so it clamps up rather
+        // than reporting a walk that is over.
+        assert_eq!(page(Some(0)).rows.len(), 1);
+        assert!(page(Some(0)).next_cursor.is_some());
+        assert_eq!(page(Some(usize::MAX)).rows.len(), 4, "clamped to MAX_LIMIT");
+        assert_eq!(page(None).rows.len(), 4, "fewer rows than DEFAULT_LIMIT");
+    }
+
+    #[test]
+    fn a_cursor_this_did_not_issue_is_rejected() {
+        // Not an empty page: a caller replaying a stale cursor would read silence as
+        // the end of the walk.
+        let (_dir, store) = seeded();
+        let got = store.reader().page(
+            &Filter::default(),
+            Some("cursor-from-somewhere-else"),
+            Order::Ascending,
+            None,
+        );
+        assert!(got.is_err());
     }
 }
