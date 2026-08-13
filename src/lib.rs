@@ -104,6 +104,26 @@ impl Tip {
     }
 }
 
+/// Everything one change to the chain means for the index: what to drop, what to
+/// insert, where the index stands afterwards.
+///
+/// Built by whoever watches the chain (a node's notification handler), consumed
+/// whole by [`Store::apply`] — one struct, so the parts cannot be applied
+/// separately and drift.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// Drop this block and everything above it.
+    pub revert_from: Option<u64>,
+    /// Rows to insert, in chain order.
+    pub rows: Vec<IndexedTx>,
+    /// Where the index stands afterwards — the resume point after a restart.
+    pub tip: Option<Tip>,
+    /// The committed tip, for acknowledging progress upstream. `None` for a pure
+    /// revert: acknowledging one as progress lets the node prune history the index
+    /// still needs replayed.
+    pub committed: Option<Tip>,
+}
+
 const CF_PRIMARY: &str = "primary";
 const CF_FROM: &str = "from";
 const CF_TO: &str = "to";
@@ -222,8 +242,8 @@ impl Store {
         }
     }
 
-    /// Apply one notification atomically: drop `revert_from` and above, insert
-    /// `commit`, record the new tip.
+    /// Apply one [`Plan`] atomically: drop `revert_from` and above, insert `rows`,
+    /// record the new tip.
     ///
     /// One `WriteBatch` on purpose. A reorg is a revert *and* a commit, and a crash
     /// between them would leave orphaned entries under a tip claiming they are
@@ -235,16 +255,11 @@ impl Store {
     /// not contiguous (their prefix is an address or a type), so each is reconstructed
     /// from the primary row being dropped. Miss one and that keyspace serves ghosts —
     /// `revert_scrubs_every_secondary_keyspace` below pins all three.
-    pub fn apply(
-        &mut self,
-        revert_from: Option<u64>,
-        commit: &[IndexedTx],
-        tip: Option<Tip>,
-    ) -> eyre::Result<()> {
+    pub fn apply(&mut self, plan: &Plan) -> eyre::Result<()> {
         let (p, f, t, ty) = cfs(&self.db);
         let mut batch = WriteBatch::default();
 
-        if let Some(from_block) = revert_from {
+        if let Some(from_block) = plan.revert_from {
             let start = pos_key(Position::new(from_block, 0));
             for item in self
                 .db
@@ -262,7 +277,7 @@ impl Store {
             }
         }
 
-        for row in commit {
+        for row in &plan.rows {
             batch.put_cf(p, pos_key(row.position), encode_row(row));
             batch.put_cf(f, sec_key(row.from.as_slice(), row.position), []);
             if let Some(to) = &row.to {
@@ -271,7 +286,7 @@ impl Store {
             batch.put_cf(ty, sec_key(&[row.tx_type], row.position), []);
         }
 
-        if let Some(tip) = tip {
+        if let Some(tip) = plan.tip {
             let mut v = Vec::with_capacity(40);
             v.extend_from_slice(&tip.block_num.to_be_bytes());
             v.extend_from_slice(tip.hash.as_slice());
@@ -592,6 +607,17 @@ mod tests {
         (dir, store)
     }
 
+    /// A [`Plan`] for tests: insert `rows` (dropping from `revert_from` first) and
+    /// move the tip.
+    fn plan(revert_from: Option<u64>, rows: Vec<IndexedTx>, tip: Option<Tip>) -> Plan {
+        Plan {
+            revert_from,
+            rows,
+            tip,
+            ..Default::default()
+        }
+    }
+
     fn seeded() -> (TempDir, Store) {
         let (dir, mut store) = empty();
         let entries = vec![
@@ -600,7 +626,7 @@ mod tests {
             tx(2, 0, 0xbb, Some(0xaa), 0),
             tx(3, 0, 0xaa, None, 2),
         ];
-        store.apply(None, &entries, tip(3)).unwrap();
+        store.apply(&plan(None, entries, tip(3))).unwrap();
         (dir, store)
     }
 
@@ -769,7 +795,7 @@ mod tests {
     #[test]
     fn revert_drops_the_block_and_everything_above() {
         let (_dir, mut store) = seeded();
-        store.apply(Some(2), &[], tip(1)).unwrap();
+        store.apply(&plan(Some(2), vec![], tip(1))).unwrap();
         let left = store
             .reader()
             .query(&Filter::default(), None, Order::Ascending, 10)
@@ -784,7 +810,7 @@ mod tests {
         // The KV-specific hazard a SQL DELETE never had: each secondary entry is
         // reconstructed from its primary row. A missed one serves ghosts.
         let (_dir, mut store) = seeded();
-        store.apply(Some(1), &[], tip(0)).unwrap();
+        store.apply(&plan(Some(1), vec![], tip(0))).unwrap();
         for filter in [
             Filter {
                 from: Some(addr(0xaa)),
@@ -825,7 +851,7 @@ mod tests {
         for b in 3..=60u64 {
             rows.push(tx(b, 0, 0xbb, Some(0xcc), 2));
         }
-        store.apply(None, &rows, tip(60)).unwrap();
+        store.apply(&plan(None, rows, tip(60))).unwrap();
 
         let filter = Filter {
             from: Some(addr(0x0a)),
@@ -853,7 +879,7 @@ mod tests {
     fn reorg_replaces_rather_than_merges() {
         let (_dir, mut store) = seeded();
         let replacement = vec![tx(2, 0, 0xdd, Some(0xee), 2)];
-        store.apply(Some(2), &replacement, tip(3)).unwrap();
+        store.apply(&plan(Some(2), replacement, tip(3))).unwrap();
 
         let orphaned = store
             .reader()
@@ -888,7 +914,7 @@ mod tests {
     fn reapplying_a_block_does_not_duplicate_it() {
         let (_dir, mut store) = seeded();
         store
-            .apply(None, &[tx(1, 0, 0xaa, Some(0xbb), 2)], tip(3))
+            .apply(&plan(None, vec![tx(1, 0, 0xaa, Some(0xbb), 2)], tip(3)))
             .unwrap();
         let got = store
             .reader()
@@ -907,15 +933,15 @@ mod tests {
     fn tip_round_trips_with_its_hash() {
         let (_dir, mut store) = empty();
         let want = Tip::new(7, B256::from([0x7c; 32]));
-        store.apply(None, &[], Some(want)).unwrap();
+        store.apply(&plan(None, vec![], Some(want))).unwrap();
         assert_eq!(store.indexed_tip().unwrap(), Some(want));
     }
 
     #[test]
     fn tip_is_replaced_not_appended() {
         let (_dir, mut store) = empty();
-        store.apply(None, &[], tip(1)).unwrap();
-        store.apply(None, &[], tip(2)).unwrap();
+        store.apply(&plan(None, vec![], tip(1))).unwrap();
+        store.apply(&plan(None, vec![], tip(2))).unwrap();
         assert_eq!(store.indexed_tip().unwrap(), tip(2));
     }
 
@@ -923,7 +949,7 @@ mod tests {
     fn a_revert_moves_the_tip_back() {
         let (_dir, mut store) = seeded();
         assert_eq!(store.indexed_tip().unwrap(), tip(3));
-        store.apply(Some(2), &[], tip(1)).unwrap();
+        store.apply(&plan(Some(2), vec![], tip(1))).unwrap();
         assert_eq!(store.indexed_tip().unwrap(), tip(1));
     }
 
@@ -934,7 +960,7 @@ mod tests {
         let (_dir, mut store) = empty();
         let reader = store.reader();
         store
-            .apply(None, &[tx(1, 0, 0xaa, Some(0xbb), 2)], tip(1))
+            .apply(&plan(None, vec![tx(1, 0, 0xaa, Some(0xbb), 2)], tip(1)))
             .unwrap();
         let got = reader
             .query(&Filter::default(), None, Order::Ascending, 10)
