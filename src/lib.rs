@@ -124,6 +124,36 @@ pub struct Plan {
     pub committed: Option<Tip>,
 }
 
+impl Plan {
+    /// Fold `next` into `self`, so that one [`Store::apply`] of the result leaves
+    /// the index exactly as applying the two in order would.
+    ///
+    /// This is what lets an indexer that fell behind catch up in batches: at
+    /// sub-second block times, notifications queue faster than one write apiece
+    /// can drain them, so the watcher folds everything already queued into a
+    /// single atomic write instead of replaying it block by block.
+    /// `merge_matches_sequential_apply` below pins the equivalence.
+    pub fn merge(&mut self, next: Plan) {
+        if let Some(from) = next.revert_from {
+            // Rows this plan would have inserted at or above the cut are orphaned
+            // before ever reaching the store; the store's own rows are covered by
+            // keeping the lowest cut.
+            self.rows.retain(|row| row.position.block_num < from);
+            self.revert_from = Some(self.revert_from.map_or(from, |f| f.min(from)));
+            // A commit that only ever existed inside this merge was orphaned with
+            // its rows, and must not be acknowledged as progress.
+            if self.committed.is_some_and(|c| c.block_num >= from) {
+                self.committed = None;
+            }
+        }
+        self.rows.extend(next.rows);
+        // Later knowledge wins; `or` keeps ours when `next` learned nothing new
+        // (a pure revert carries a tip but no commit).
+        self.tip = next.tip.or(self.tip);
+        self.committed = next.committed.or(self.committed);
+    }
+}
+
 const CF_PRIMARY: &str = "primary";
 const CF_FROM: &str = "from";
 const CF_TO: &str = "to";
@@ -1069,5 +1099,149 @@ mod tests {
             None,
         );
         assert!(got.is_err());
+    }
+
+    /// A commit plan for `rows` ending at `tip_block`, as a watcher would build it.
+    fn commit(rows: Vec<IndexedTx>, tip_block: u64) -> Plan {
+        Plan {
+            revert_from: None,
+            rows,
+            tip: tip(tip_block),
+            committed: tip(tip_block),
+        }
+    }
+
+    #[test]
+    fn merge_concatenates_commits() {
+        let mut merged = commit(vec![tx(1, 0, 0xaa, None, 2)], 1);
+        merged.merge(commit(vec![tx(2, 0, 0xbb, None, 2)], 2));
+        assert_eq!(
+            merged,
+            Plan {
+                revert_from: None,
+                rows: vec![tx(1, 0, 0xaa, None, 2), tx(2, 0, 0xbb, None, 2)],
+                tip: tip(2),
+                committed: tip(2),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_reorg_cuts_unwritten_rows() {
+        // Blocks 2 and 3 exist only inside the merge; the reorg at 2 orphans them
+        // before they ever reach the store, and the replacement row wins.
+        let mut merged = commit(vec![tx(1, 0, 0xaa, None, 2), tx(2, 0, 0xbb, None, 2)], 2);
+        merged.merge(commit(vec![tx(3, 0, 0xcc, None, 2)], 3));
+        merged.merge(Plan {
+            revert_from: Some(2),
+            rows: vec![tx(2, 0, 0xdd, None, 0)],
+            tip: tip(2),
+            committed: tip(2),
+        });
+        assert_eq!(
+            merged,
+            Plan {
+                revert_from: Some(2),
+                rows: vec![tx(1, 0, 0xaa, None, 2), tx(2, 0, 0xdd, None, 0)],
+                tip: tip(2),
+                committed: tip(2),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_keeps_lowest_cut() {
+        // Two reverts: the store must be scrubbed from the lower of the two, no
+        // matter the order they arrive in.
+        let mut merged = plan(Some(5), vec![], tip(4));
+        merged.merge(plan(Some(3), vec![], tip(2)));
+        assert_eq!(merged.revert_from, Some(3));
+
+        let mut merged = plan(Some(3), vec![], tip(2));
+        merged.merge(plan(Some(5), vec![], tip(4)));
+        assert_eq!(merged.revert_from, Some(3));
+    }
+
+    #[test]
+    fn merge_revert_only_drops_batch_commit() {
+        // The commit at 2 was orphaned inside the merge; acknowledging it upstream
+        // would let the node prune history the index still needs replayed.
+        let mut merged = commit(vec![tx(2, 0, 0xaa, None, 2)], 2);
+        merged.merge(plan(Some(2), vec![], tip(1)));
+        assert_eq!(merged.committed, None);
+        assert_eq!(merged.tip, tip(1), "tip still moves to the revert's parent");
+        assert!(merged.rows.is_empty());
+    }
+
+    #[test]
+    fn merge_matches_sequential_apply() {
+        // The contract `merge` exists for: one apply of the fold leaves the store
+        // exactly as applying each plan in order would — including a reorg that
+        // cuts into rows the store already holds.
+        let history = || {
+            vec![
+                commit(
+                    vec![tx(1, 0, 0xaa, Some(0xbb), 2), tx(1, 1, 0xaa, None, 0)],
+                    1,
+                ),
+                commit(vec![tx(2, 0, 0xbb, Some(0xaa), 2)], 2),
+                commit(vec![tx(3, 0, 0xcc, None, 2)], 3),
+                // Reorg: 2 and 3 are replaced by a different block 2.
+                Plan {
+                    revert_from: Some(2),
+                    rows: vec![tx(2, 0, 0xdd, Some(0xee), 0)],
+                    tip: Some(Tip::new(2, B256::from([0x22; 32]))),
+                    committed: Some(Tip::new(2, B256::from([0x22; 32]))),
+                },
+                commit(vec![tx(3, 0, 0xee, Some(0xdd), 2)], 3),
+            ]
+        };
+
+        let (_seq_dir, mut sequential) = seeded();
+        for plan in history() {
+            sequential.apply(&plan).unwrap();
+        }
+
+        let (_merged_dir, mut merged_store) = seeded();
+        let mut folded = Plan::default();
+        for plan in history() {
+            folded.merge(plan);
+        }
+        merged_store.apply(&folded).unwrap();
+
+        let all = |store: &Store| {
+            store
+                .reader()
+                .query(&Filter::default(), None, Order::Ascending, MAX_LIMIT)
+                .unwrap()
+        };
+        assert_eq!(all(&sequential), all(&merged_store));
+        assert_eq!(
+            sequential.indexed_tip().unwrap(),
+            merged_store.indexed_tip().unwrap()
+        );
+        // The secondaries were scrubbed identically too — query each one.
+        for filter in [
+            Filter {
+                from: Some(addr(0xbb)),
+                ..Default::default()
+            },
+            Filter {
+                to: Some(addr(0xaa)),
+                ..Default::default()
+            },
+            Filter {
+                tx_type: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let seq = sequential
+                .reader()
+                .query(&filter, None, Order::Ascending, MAX_LIMIT);
+            let mrg = merged_store
+                .reader()
+                .query(&filter, None, Order::Ascending, MAX_LIMIT);
+            assert_eq!(seq.unwrap(), mrg.unwrap());
+        }
     }
 }
