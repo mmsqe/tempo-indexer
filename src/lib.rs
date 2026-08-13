@@ -1174,6 +1174,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_a_commit_below_the_cut() {
+        // The batch committed block 2, then a queued reorg cut from block 5. Block 2
+        // is still canonical, and the merged apply is this batch's only chance to
+        // acknowledge it -- dropping it is safe but pays a replay for nothing.
+        let mut merged = Plan {
+            rows: vec![tx(2, 0, 0xaa, None, 2)],
+            tip: tip(2),
+            committed: tip(2),
+            ..Default::default()
+        };
+        merged.merge(Plan {
+            revert_from: Some(5),
+            tip: tip(4),
+            ..Default::default()
+        });
+        assert_eq!(
+            merged.committed,
+            tip(2),
+            "a commit below the cut survived the merge"
+        );
+        assert_eq!(merged.tip, tip(4));
+    }
+
+    #[test]
     fn merge_matches_sequential_apply() {
         // The contract `merge` exists for: one apply of the fold leaves the store
         // exactly as applying each plan in order would — including a reorg that
