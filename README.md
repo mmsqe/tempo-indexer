@@ -17,10 +17,12 @@ mistakes are expensive.
 RocksDB, one primary keyspace and one secondary per filterable column:
 
 ```
-primary   block‖idx           → hash, from, type, to?
+primary   block‖idx           → hash, from, type, fee_token?, fee_payer?, to*
 from      from ‖block‖idx     → ()
 to        to   ‖block‖idx     → ()
 type      type ‖block‖idx     → ()
+fee_token fee_token‖block‖idx → ()
+fee_payer fee_payer‖block‖idx → ()
 ```
 
 Chain position is the suffix everywhere, because it is the only *total* order
@@ -29,17 +31,25 @@ three things: cursors are stable, so a page boundary cannot drift as new blocks 
 every secondary range iterates in chain order for free; and filters intersect by merging
 sorted ranges rather than by loading and sorting.
 
-A block range is not a fourth keyspace for the same reason: every key already ends in
-`block‖idx`, so `fromBlock`/`toBlock` is where each walk seeks to and where it stops.
-
-Neither is "did this address take part", the first query a wallet makes: it is the
-`from` and `to` walks unioned — the same sorted merge as the intersection around it. A
-keyspace of its own would answer it in one walk instead of two, but cost an extra entry
-per transaction on every write; the read is the cheaper side to pay on.
-
 Rows hold positions and filter keys, never transaction bodies — the node already stores
 those. Disk grows with transaction *count* rather than size, and the index can be deleted
 and rebuilt without touching the node's own state.
+
+A transaction has one `to` entry per *distinct address it calls*. A chain may batch, and
+an index that recorded only the first target answers a `to` filter on any of the others
+with silence — which reads exactly like "no such transactions".
+
+`fee_token` and `fee_payer` are for chains where gas can be paid in a chosen token or by
+someone other than the sender; where it cannot, both are unset and neither keyspace is
+written. `fee_payer` records who paid for *every* transaction, the sender included: a
+filter answering "who paid" for some and nothing for the rest leaves no way to ask for
+the half it dropped. That costs one entry per transaction.
+
+Two things are deliberately *not* keyspaces. A block range is where each walk seeks to
+and where it stops, since every key already ends in `block‖idx`. And "did this address
+take part" is the `from` and `to` walks unioned — the same sorted merge as the
+intersection around it; a keyspace of its own would answer in one walk instead of two, at
+an extra entry per transaction on every write, and the read is the cheaper side to pay on.
 
 ## Writes are atomic, because reorgs are not rare
 

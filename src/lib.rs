@@ -13,8 +13,10 @@
 //! filterable column — `from`, `to`, `type` — each keyed `value‖block‖idx → ()`. Chain
 //! position is the suffix everywhere because it is the only total order transactions
 //! have: it keeps cursors stable (a page boundary cannot drift as new blocks arrive)
-//! and makes every secondary range iterate in chain order for free. Rows hold positions
-//! and filter keys, never transaction bodies — the node already stores those.
+//! and makes every secondary range iterate in chain order for free. A transaction gets
+//! one `to` entry per distinct address it calls, because a chain may batch and an index
+//! that recorded only the first target answers with silence. Rows hold positions and
+//! filter keys, never transaction bodies — the node already stores those.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -74,9 +76,21 @@ pub struct IndexedTx {
     pub position: Position,
     pub hash: TxHash,
     pub from: Address,
-    /// `None` for contract creation.
-    pub to: Option<Address>,
+    /// Every address this transaction calls, in call order; empty for a creation.
+    ///
+    /// A list because a chain may batch, and a `to` filter that saw only the first
+    /// target would miss the rest silently. Repeats are allowed and indexed once.
+    pub to: Vec<Address>,
     pub tx_type: u8,
+    /// Which token paid, where a chain lets one choose. `None` for the native currency.
+    pub fee_token: Option<Address>,
+    /// Who paid — the sponsor where one paid, the sender otherwise. `None` where the
+    /// chain has no notion of it.
+    ///
+    /// Set for every transaction, not only sponsored ones: a filter meaning "who paid"
+    /// for some and nothing for the rest leaves the caller no way to ask for the half
+    /// it dropped.
+    pub fee_payer: Option<Address>,
 }
 
 /// An inclusive window of block heights, either end open.
@@ -104,6 +118,10 @@ pub struct Filter {
     /// rather than two merged by the caller.
     pub address: Option<Address>,
     pub tx_type: Option<u8>,
+    /// Which token paid, for a chain where that is a choice.
+    pub fee_token: Option<Address>,
+    /// Who paid — the sponsor where one paid, the sender otherwise.
+    pub fee_payer: Option<Address>,
     /// The heights to walk. Not a keyspace of its own: every key already ends in
     /// `block‖idx`, so a range is where each walk starts and stops.
     pub blocks: BlockRange,
@@ -180,7 +198,17 @@ const CF_PRIMARY: &str = "primary";
 const CF_FROM: &str = "from";
 const CF_TO: &str = "to";
 const CF_TYPE: &str = "type";
-const CFS: [&str; 4] = [CF_PRIMARY, CF_FROM, CF_TO, CF_TYPE];
+const CF_FEE_TOKEN: &str = "fee_token";
+const CF_FEE_PAYER: &str = "fee_payer";
+const CFS: [&str; 6] = [
+    CF_PRIMARY,
+    CF_FROM,
+    CF_TO,
+    CF_TYPE,
+    CF_FEE_TOKEN,
+    CF_FEE_PAYER,
+];
+
 /// The resume point: one key in the default keyspace, replaced on every applied tip.
 const TIP_KEY: &[u8] = b"tip";
 
@@ -205,6 +233,48 @@ fn pos_from_key(suffix: &[u8]) -> eyre::Result<Position> {
     ))
 }
 
+/// The addresses a row calls, without repeats — a batch that names one twice still
+/// owns one entry, and a revert has to delete that entry exactly once.
+fn targets(row: &IndexedTx) -> Vec<Address> {
+    let mut out = Vec::with_capacity(row.to.len());
+    for to in &row.to {
+        if !out.contains(to) {
+            out.push(*to);
+        }
+    }
+    out
+}
+
+/// Every secondary entry a row owns: which keyspace, and the prefix within it.
+///
+/// One definition, read by the write and the revert paths alike. A revert rebuilds a
+/// row's entries from the row itself, so a column added to one path and forgotten in
+/// the other leaves that keyspace serving ghosts.
+fn secondaries(row: &IndexedTx) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = vec![(CF_FROM, row.from.to_vec()), (CF_TYPE, vec![row.tx_type])];
+    out.extend(row.fee_token.map(|a| (CF_FEE_TOKEN, a.to_vec())));
+    out.extend(row.fee_payer.map(|a| (CF_FEE_PAYER, a.to_vec())));
+    out.extend(targets(row).iter().map(|a| (CF_TO, a.to_vec())));
+    out
+}
+
+/// The filters one walk answers, as the keyspace and prefix to walk.
+///
+/// One list, so a column becomes filterable in one edit. `address` is not in it: it is
+/// a union of two walks, with no keyspace of its own.
+fn columns(filter: &Filter) -> Vec<(&'static str, Vec<u8>)> {
+    [
+        filter.from.map(|a| (CF_FROM, a.to_vec())),
+        filter.to.map(|a| (CF_TO, a.to_vec())),
+        filter.tx_type.map(|t| (CF_TYPE, vec![t])),
+        filter.fee_token.map(|a| (CF_FEE_TOKEN, a.to_vec())),
+        filter.fee_payer.map(|a| (CF_FEE_PAYER, a.to_vec())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 fn sec_key(prefix: &[u8], pos: Position) -> Vec<u8> {
     let mut k = Vec::with_capacity(prefix.len() + 12);
     k.extend_from_slice(prefix);
@@ -212,34 +282,84 @@ fn sec_key(prefix: &[u8], pos: Position) -> Vec<u8> {
     k
 }
 
-/// `hash ‖ from ‖ type ‖ has_to ‖ [to]` — 54 or 74 bytes.
+/// `hash ‖ from ‖ type ‖ flags` — what every row carries before its addresses.
+const ROW_HEADER: usize = 54;
+/// Which optional addresses follow the header, in the order they are written.
+const HAS_FEE_TOKEN: u8 = 1 << 0;
+const HAS_FEE_PAYER: u8 = 1 << 1;
+const FLAGS: [u8; 2] = [HAS_FEE_TOKEN, HAS_FEE_PAYER];
+const KNOWN_FLAGS: u8 = HAS_FEE_TOKEN | HAS_FEE_PAYER;
+
+fn row_error(len: usize) -> eyre::Report {
+    eyre::eyre!(
+        "row value: {len} bytes is not a {ROW_HEADER}-byte header, its flagged \
+         addresses and whole call targets -- an index written by an older layout has \
+         to be deleted and rebuilt",
+    )
+}
+
+/// `hash ‖ from ‖ type ‖ flags ‖ [fee_token] ‖ [fee_payer] ‖ to*n`.
+///
+/// The optional addresses are flagged because nothing about their width tells them
+/// apart from a call target; the targets need no count because they are whatever is
+/// left, and addresses are fixed width.
 fn encode_row(row: &IndexedTx) -> Vec<u8> {
-    let mut v = Vec::with_capacity(74);
+    let optional = [row.fee_token, row.fee_payer];
+    let mut v = Vec::with_capacity(ROW_HEADER + 20 * (row.to.len() + optional.len()));
     v.extend_from_slice(row.hash.as_slice());
     v.extend_from_slice(row.from.as_slice());
     v.push(row.tx_type);
-    match &row.to {
-        Some(to) => {
-            v.push(1);
-            v.extend_from_slice(to.as_slice());
-        }
-        None => v.push(0),
+    v.push(
+        FLAGS
+            .iter()
+            .zip(optional)
+            .filter(|(_, value)| value.is_some())
+            .fold(0, |flags, (bit, _)| flags | bit),
+    );
+    for address in optional.into_iter().flatten().chain(row.to.iter().copied()) {
+        v.extend_from_slice(address.as_slice());
     }
     v
 }
 
 fn decode_row(position: Position, val: &[u8]) -> eyre::Result<IndexedTx> {
-    let to = match (val.len(), val.get(53)) {
-        (54, Some(0)) => None,
-        (74, Some(1)) => Some(Address::from_slice(&val[54..74])),
-        (n, flag) => eyre::bail!("row value: unexpected length {n} / to-flag {flag:?}"),
+    if val.len() < ROW_HEADER {
+        return Err(row_error(val.len()));
+    }
+    let flags = val[53];
+    // A flag this build does not know means a field it cannot place, and everything
+    // after that field would decode as something else.
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(row_error(val.len()));
+    }
+
+    let mut rest = &val[ROW_HEADER..];
+    // Each flagged address in turn, then whatever is left is the call targets.
+    let mut take = |bit: u8| -> eyre::Result<Option<Address>> {
+        if flags & bit == 0 {
+            return Ok(None);
+        }
+        let (head, tail) = rest
+            .split_at_checked(20)
+            .ok_or_else(|| row_error(val.len()))?;
+        rest = tail;
+        Ok(Some(Address::from_slice(head)))
     };
+    let fee_token = take(HAS_FEE_TOKEN)?;
+    let fee_payer = take(HAS_FEE_PAYER)?;
+
+    let to = rest.chunks_exact(20);
+    if !to.remainder().is_empty() {
+        return Err(row_error(val.len()));
+    }
     Ok(IndexedTx {
         position,
         hash: B256::from_slice(&val[..32]),
         from: Address::from_slice(&val[32..52]),
-        to,
+        to: to.map(Address::from_slice).collect(),
         tx_type: val[52],
+        fee_token,
+        fee_payer,
     })
 }
 
@@ -304,11 +424,10 @@ impl Store {
     /// deletes, so the puts win.
     ///
     /// A revert must scrub every keyspace by hand: a block's secondary entries are
-    /// not contiguous (their prefix is an address or a type), so each is reconstructed
-    /// from the primary row being dropped. Miss one and that keyspace serves ghosts —
-    /// `revert_scrubs_every_secondary_keyspace` below pins all three.
+    /// not contiguous (their prefix is an address or a type), so each is rebuilt from
+    /// the primary row being dropped. Miss one and that keyspace serves ghosts.
     pub fn apply(&mut self, plan: &Plan) -> eyre::Result<()> {
-        let (p, f, t, ty) = cfs(&self.db);
+        let p = cf(&self.db, CF_PRIMARY);
         let mut batch = WriteBatch::default();
 
         if let Some(from_block) = plan.revert_from {
@@ -321,21 +440,17 @@ impl Store {
                 let position = pos_from_key(&key)?;
                 let row = decode_row(position, &val)?;
                 batch.delete_cf(p, &key);
-                batch.delete_cf(f, sec_key(row.from.as_slice(), position));
-                if let Some(to) = &row.to {
-                    batch.delete_cf(t, sec_key(to.as_slice(), position));
+                for (name, prefix) in secondaries(&row) {
+                    batch.delete_cf(cf(&self.db, name), sec_key(&prefix, position));
                 }
-                batch.delete_cf(ty, sec_key(&[row.tx_type], position));
             }
         }
 
         for row in &plan.rows {
             batch.put_cf(p, pos_key(row.position), encode_row(row));
-            batch.put_cf(f, sec_key(row.from.as_slice(), row.position), []);
-            if let Some(to) = &row.to {
-                batch.put_cf(t, sec_key(to.as_slice(), row.position), []);
+            for (name, prefix) in secondaries(row) {
+                batch.put_cf(cf(&self.db, name), sec_key(&prefix, row.position), []);
             }
-            batch.put_cf(ty, sec_key(&[row.tx_type], row.position), []);
         }
 
         if let Some(tip) = plan.tip {
@@ -396,11 +511,8 @@ impl Reader {
 
         // One term per filter, intersected. Only `address` is more than one walk.
         let mut terms = Vec::new();
-        if let Some(from) = filter.from {
-            terms.push(Term::new(vec![walk(CF_FROM, from.as_slice())?], order)?);
-        }
-        if let Some(to) = filter.to {
-            terms.push(Term::new(vec![walk(CF_TO, to.as_slice())?], order)?);
+        for (name, prefix) in columns(filter) {
+            terms.push(Term::new(vec![walk(name, &prefix)?], order)?);
         }
         if let Some(address) = filter.address {
             terms.push(Term::new(
@@ -411,11 +523,8 @@ impl Reader {
                 order,
             )?);
         }
-        if let Some(ty) = filter.tx_type {
-            terms.push(Term::new(vec![walk(CF_TYPE, &[ty])?], order)?);
-        }
 
-        let primary = self.db.cf_handle(CF_PRIMARY).expect("cf created at open");
+        let primary = cf(&self.db, CF_PRIMARY);
 
         // No filters: walk the primary directly — its values are the rows.
         if terms.is_empty() {
@@ -500,20 +609,10 @@ impl Reader {
     }
 }
 
-type Cfs<'a> = (
-    &'a ColumnFamily,
-    &'a ColumnFamily,
-    &'a ColumnFamily,
-    &'a ColumnFamily,
-);
-
-fn cfs(db: &DB) -> Cfs<'_> {
-    (
-        db.cf_handle(CF_PRIMARY).expect("cf created at open"),
-        db.cf_handle(CF_FROM).expect("cf created at open"),
-        db.cf_handle(CF_TO).expect("cf created at open"),
-        db.cf_handle(CF_TYPE).expect("cf created at open"),
-    )
+/// A keyspace handle by name. Every name in use is a `CFS` entry created at open, so
+/// a miss is a typo in this file rather than anything a caller can cause.
+fn cf<'a>(db: &'a DB, name: &str) -> &'a ColumnFamily {
+    db.cf_handle(name).expect("cf created at open")
 }
 
 fn read_tip(db: &DB) -> eyre::Result<Option<Tip>> {
@@ -765,8 +864,34 @@ mod tests {
             position: Position::new(block, index),
             hash: B256::from([(block * 10 + u64::from(index)) as u8; 32]),
             from: addr(from),
-            to: to.map(addr),
+            to: to.map(addr).into_iter().collect(),
             tx_type,
+            fee_token: None,
+            fee_payer: None,
+        }
+    }
+
+    /// A transaction whose gas someone else paid, in a token of its choosing.
+    fn sponsored(
+        block: u64,
+        index: u32,
+        from: u8,
+        to: Option<u8>,
+        fee_token: Option<u8>,
+        fee_payer: u8,
+    ) -> IndexedTx {
+        IndexedTx {
+            fee_token: fee_token.map(addr),
+            fee_payer: Some(addr(fee_payer)),
+            ..tx(block, index, from, to, 0x76)
+        }
+    }
+
+    /// A transaction that calls several addresses, as a batch does.
+    fn batch(block: u64, index: u32, from: u8, to: &[u8], tx_type: u8) -> IndexedTx {
+        IndexedTx {
+            to: to.iter().copied().map(addr).collect(),
+            ..tx(block, index, from, None, tx_type)
         }
     }
 
@@ -878,6 +1003,121 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].position, Position::new(1, 0));
+    }
+
+    #[test]
+    fn every_call_target_is_found_by_a_to_filter() {
+        // The whole point of a list: a batch reaches several contracts, and before
+        // this only the first was indexed -- a `to` filter on any later one came back
+        // empty, which reads exactly like "no such transactions".
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![batch(1, 0, 0xaa, &[0xc1, 0xc2, 0xc3], 0x76)],
+                tip(1),
+            ))
+            .unwrap();
+
+        for target in [0xc1, 0xc2, 0xc3] {
+            let filter = Filter {
+                to: Some(addr(target)),
+                ..Default::default()
+            };
+            assert_eq!(
+                positions(&store, &filter, Order::Ascending),
+                vec![Position::new(1, 0)],
+                "the call to {target:#x} was not indexed",
+            );
+        }
+        // And an address it never calls is still not a match.
+        let filter = Filter {
+            to: Some(addr(0xc4)),
+            ..Default::default()
+        };
+        assert!(positions(&store, &filter, Order::Ascending).is_empty());
+    }
+
+    #[test]
+    fn a_row_round_trips_any_number_of_targets() {
+        let (_dir, mut store) = empty();
+        let rows = vec![
+            tx(1, 0, 0xaa, None, 2),
+            tx(2, 0, 0xaa, Some(0xbb), 2),
+            batch(3, 0, 0xaa, &[0xc1, 0xc2], 0x76),
+            // The same address twice, which a batch is free to do.
+            batch(4, 0, 0xaa, &[0xc1, 0xc1], 0x76),
+        ];
+        store.apply(&plan(None, rows.clone(), tip(4))).unwrap();
+        let got = store
+            .reader()
+            .query(&Filter::default(), None, Order::Ascending, MAX_LIMIT)
+            .unwrap();
+        assert_eq!(got, rows, "the row is not what came back out of the store");
+    }
+
+    #[test]
+    fn a_repeated_target_is_indexed_once() {
+        // Two calls to the same address are one entry in the `to` keyspace. Writing
+        // it twice is harmless; the hazard is a revert that deletes it once.
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![batch(1, 0, 0xaa, &[0xc1, 0xc1], 0x76)],
+                tip(1),
+            ))
+            .unwrap();
+        let filter = Filter {
+            to: Some(addr(0xc1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            positions(&store, &filter, Order::Ascending),
+            vec![Position::new(1, 0)],
+            "a repeated target must not page as two hits",
+        );
+    }
+
+    #[test]
+    fn a_revert_scrubs_every_target_of_a_batch() {
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![batch(1, 0, 0xaa, &[0xc1, 0xc2, 0xc3], 0x76)],
+                tip(1),
+            ))
+            .unwrap();
+        store.apply(&plan(Some(1), vec![], tip(0))).unwrap();
+
+        for target in [0xc1, 0xc2, 0xc3] {
+            let filter = Filter {
+                to: Some(addr(target)),
+                ..Default::default()
+            };
+            assert!(
+                positions(&store, &filter, Order::Ascending).is_empty(),
+                "the revert left {target:#x} behind",
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_that_is_not_whole_addresses_is_rejected() {
+        // The layout has changed twice and carries no version byte, so a stored row
+        // from an older one has to fail loudly rather than decode as a different
+        // transaction. Width is what catches it: addresses are fixed, so anything
+        // left over is not a row this build wrote.
+        let mut val = encode_row(&tx(1, 0, 0xaa, Some(0xbb), 2));
+        val.pop();
+        let err = decode_row(Position::new(1, 0), &val)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("deleted and rebuilt"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
@@ -1217,7 +1457,10 @@ mod tests {
             .query(&Filter::default(), None, Order::Ascending, 10)
             .unwrap();
         let creation = got.iter().find(|t| t.position.block_num == 3).unwrap();
-        assert_eq!(creation.to, None);
+        assert!(
+            creation.to.is_empty(),
+            "a creation calls no existing address"
+        );
     }
 
     #[test]
@@ -1407,6 +1650,160 @@ mod tests {
             )
             .unwrap();
         assert_eq!(canonical.len(), 1);
+    }
+
+    #[test]
+    fn the_fee_payer_and_fee_token_are_filterable() {
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![
+                    // Sponsored by 0xf0, paid in 0xt1.
+                    sponsored(1, 0, 0xaa, Some(0xbb), Some(0xe1), 0xf0),
+                    // Sponsored by 0xf0 too, but paid in the native currency.
+                    sponsored(2, 0, 0xaa, Some(0xbb), None, 0xf0),
+                    // Nobody sponsored this one: the sender paid for themselves.
+                    sponsored(3, 0, 0xcc, Some(0xbb), Some(0xe1), 0xcc),
+                ],
+                tip(3),
+            ))
+            .unwrap();
+
+        let by_payer = |payer| Filter {
+            fee_payer: Some(addr(payer)),
+            ..Default::default()
+        };
+        assert_eq!(
+            positions(&store, &by_payer(0xf0), Order::Ascending),
+            vec![Position::new(1, 0), Position::new(2, 0)],
+        );
+        // The unsponsored one is found by its own sender, because "who paid" is
+        // recorded for every transaction rather than only the sponsored ones.
+        assert_eq!(
+            positions(&store, &by_payer(0xcc), Order::Ascending),
+            vec![Position::new(3, 0)],
+        );
+        assert_eq!(
+            positions(
+                &store,
+                &Filter {
+                    fee_token: Some(addr(0xe1)),
+                    ..Default::default()
+                },
+                Order::Ascending,
+            ),
+            vec![Position::new(1, 0), Position::new(3, 0)],
+            "the transaction paying in the native currency is not in the token's walk",
+        );
+    }
+
+    #[test]
+    fn the_fee_columns_intersect_like_the_others() {
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![
+                    sponsored(1, 0, 0xaa, Some(0xbb), Some(0xe1), 0xf0),
+                    sponsored(2, 0, 0xaa, Some(0xbb), None, 0xf0),
+                ],
+                tip(2),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            positions(
+                &store,
+                &Filter {
+                    fee_payer: Some(addr(0xf0)),
+                    fee_token: Some(addr(0xe1)),
+                    ..Default::default()
+                },
+                Order::Ascending,
+            ),
+            vec![Position::new(1, 0)],
+        );
+    }
+
+    #[test]
+    fn a_revert_scrubs_the_fee_keyspaces() {
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![sponsored(1, 0, 0xaa, Some(0xbb), Some(0xe1), 0xf0)],
+                tip(1),
+            ))
+            .unwrap();
+        store.apply(&plan(Some(1), vec![], tip(0))).unwrap();
+
+        for filter in [
+            Filter {
+                fee_payer: Some(addr(0xf0)),
+                ..Default::default()
+            },
+            Filter {
+                fee_token: Some(addr(0xe1)),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                positions(&store, &filter, Order::Ascending).is_empty(),
+                "the revert left a ghost behind {filter:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_round_trips_its_optional_addresses() {
+        // Both, one, the other and neither -- the flags byte has to place what follows
+        // it, and a wrong one would read a call target as a fee payer.
+        let (_dir, mut store) = empty();
+        let rows = vec![
+            sponsored(1, 0, 0xaa, Some(0xbb), Some(0xe1), 0xf0),
+            sponsored(2, 0, 0xaa, Some(0xbb), None, 0xf0),
+            IndexedTx {
+                fee_token: Some(addr(0xe1)),
+                fee_payer: None,
+                ..tx(3, 0, 0xaa, Some(0xbb), 0x76)
+            },
+            tx(4, 0, 0xaa, Some(0xbb), 2),
+            // Optional addresses in front of several call targets.
+            IndexedTx {
+                fee_token: Some(addr(0xe1)),
+                fee_payer: Some(addr(0xf0)),
+                ..batch(5, 0, 0xaa, &[0xc1, 0xc2], 0x76)
+            },
+        ];
+        store.apply(&plan(None, rows.clone(), tip(5))).unwrap();
+        assert_eq!(
+            store
+                .reader()
+                .query(&Filter::default(), None, Order::Ascending, MAX_LIMIT)
+                .unwrap(),
+            rows,
+        );
+    }
+
+    #[test]
+    fn a_row_this_build_cannot_place_is_rejected() {
+        // Not a length check: a row of the right width whose flags name a field this
+        // build does not know would decode everything after it as something else.
+        let mut val = encode_row(&tx(1, 0, 0xaa, Some(0xbb), 2));
+        val[53] = 0x80;
+        let err = decode_row(Position::new(1, 0), &val)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("deleted and rebuilt"),
+            "unhelpful error: {err}"
+        );
+
+        // And a row too short for the address its flags promise.
+        let mut val = encode_row(&tx(1, 0, 0xaa, None, 2));
+        val[53] = HAS_FEE_PAYER;
+        assert!(decode_row(Position::new(1, 0), &val).is_err());
     }
 
     #[test]
