@@ -29,6 +29,9 @@ three things: cursors are stable, so a page boundary cannot drift as new blocks 
 every secondary range iterates in chain order for free; and filters intersect by merging
 sorted ranges rather than by loading and sorting.
 
+A block range is not a fourth keyspace for the same reason: every key already ends in
+`block‖idx`, so `fromBlock`/`toBlock` is where each walk seeks to and where it stops.
+
 Rows hold positions and filter keys, never transaction bodies — the node already stores
 those. Disk grows with transaction *count* rather than size, and the index can be deleted
 and rebuilt without touching the node's own state.

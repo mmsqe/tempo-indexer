@@ -79,12 +79,31 @@ pub struct IndexedTx {
     pub tx_type: u8,
 }
 
+/// An inclusive window of block heights, either end open.
+///
+/// Heights rather than positions: a caller asking for "blocks 1000 to 2000" means whole
+/// blocks, and the cursor is already the way to resume mid-block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockRange {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+}
+
+impl BlockRange {
+    pub const fn new(min: Option<u64>, max: Option<u64>) -> Self {
+        Self { min, max }
+    }
+}
+
 /// Which transactions a query selects. Every field is optional and they intersect.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     pub from: Option<Address>,
     pub to: Option<Address>,
     pub tx_type: Option<u8>,
+    /// The heights to walk. Not a keyspace of its own: every key already ends in
+    /// `block‖idx`, so a range is where each walk starts and stops.
+    pub blocks: BlockRange,
 }
 
 /// The canonical block the index is caught up to — where a restart resumes from.
@@ -367,9 +386,10 @@ impl Reader {
         order: Order,
         limit: usize,
     ) -> eyre::Result<Vec<IndexedTx>> {
-        // Every walk reads the same snapshot, cursor and direction; only the
-        // keyspace and its prefix differ.
-        let walk = |cf, prefix: &[u8]| scan(&self.db, snapshot, cf, prefix, after, order);
+        // Every walk reads the same snapshot, cursor, range and direction; only
+        // the keyspace and its prefix differ.
+        let walk =
+            |cf, prefix: &[u8]| scan(&self.db, snapshot, cf, prefix, after, filter.blocks, order);
 
         let mut scans = Vec::new();
         if let Some(from) = filter.from {
@@ -503,6 +523,9 @@ struct KeyScan<'a> {
     order: Order,
     /// The exact cursor key, skipped so the cursor is exclusive.
     skip: Option<Vec<u8>>,
+    /// The last block this walk may yield, in `order`'s direction; `None` leaves
+    /// that end open. The near end needs no field — it is where the walk seeked to.
+    stop: Option<u64>,
 }
 
 impl KeyScan<'_> {
@@ -515,9 +538,22 @@ impl KeyScan<'_> {
             if self.skip.as_deref() == Some(&*key) {
                 continue;
             }
-            return Ok(Some((pos_from_key(&key[self.prefix.len()..])?, val)));
+            let pos = pos_from_key(&key[self.prefix.len()..])?;
+            // Past the far end of the range; every later key is further past it,
+            // so the walk is over.
+            if self.past_stop(pos) {
+                break;
+            }
+            return Ok(Some((pos, val)));
         }
         Ok(None)
+    }
+
+    fn past_stop(&self, pos: Position) -> bool {
+        self.stop.is_some_and(|stop| match self.order {
+            Order::Ascending => pos.block_num > stop,
+            Order::Descending => pos.block_num < stop,
+        })
     }
 
     fn next_pos(&mut self) -> eyre::Result<Option<Position>> {
@@ -564,35 +600,42 @@ fn scan<'a>(
     cf: &str,
     prefix: &[u8],
     after: Option<Position>,
+    blocks: BlockRange,
     order: Order,
 ) -> eyre::Result<KeyScan<'a>> {
     let handle = db.cf_handle(cf).expect("cf created at open");
-    let (start, skip) = match after {
-        Some(pos) => {
-            let key = sec_key(prefix, pos);
-            (key.clone(), Some(key))
-        }
-        None => match order {
-            // Highest possible suffix, so the reverse walk starts inside the prefix.
-            Order::Descending => {
-                let mut k = prefix.to_vec();
-                k.extend_from_slice(&[0xFF; 12]);
-                (k, None)
-            }
-            Order::Ascending => (prefix.to_vec(), None),
-        },
+    // Where the range alone would start the walk — unbounded, the extreme position,
+    // whose key is the same all-zero or all-`0xFF` seek an unbounded walk makes.
+    let opening = match order {
+        Order::Ascending => Position::new(blocks.min.unwrap_or(0), 0),
+        Order::Descending => Position::new(blocks.max.unwrap_or(u64::MAX), u32::MAX),
     };
+    // The cursor and the range both say where to begin, and the tighter one wins:
+    // only the cursor, and a resumed page walks out of the range; only the range,
+    // and rows the cursor already returned are replayed.
+    let start = after.map_or(opening, |pos| match order {
+        Order::Ascending => pos.max(opening),
+        Order::Descending => pos.min(opening),
+    });
     let direction = match order {
         Order::Ascending => Direction::Forward,
         Order::Descending => Direction::Reverse,
     };
+    let stop = match order {
+        Order::Ascending => blocks.max,
+        Order::Descending => blocks.min,
+    };
     Ok(KeyScan {
         snapshot,
         cf: handle,
-        it: snapshot.iterator_cf(handle, IteratorMode::From(&start, direction)),
+        it: snapshot.iterator_cf(
+            handle,
+            IteratorMode::From(&sec_key(prefix, start), direction),
+        ),
         prefix: prefix.to_vec(),
         order,
-        skip,
+        skip: after.map(|pos| sec_key(prefix, pos)),
+        stop,
     })
 }
 
@@ -753,6 +796,7 @@ mod tests {
             from: Some(addr(0xaa)),
             to: Some(addr(0xbb)),
             tx_type: Some(2),
+            ..Default::default()
         };
         let got = store
             .reader()
@@ -760,6 +804,192 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].position, Position::new(1, 0));
+    }
+
+    /// The positions a whole query selects — what a range test is actually about.
+    fn positions(store: &Store, filter: &Filter, order: Order) -> Vec<Position> {
+        store
+            .reader()
+            .query(filter, None, order, MAX_LIMIT)
+            .unwrap()
+            .iter()
+            .map(|t| t.position)
+            .collect()
+    }
+
+    fn in_blocks(min: Option<u64>, max: Option<u64>) -> Filter {
+        Filter {
+            blocks: BlockRange::new(min, max),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_block_range_bounds_the_walk() {
+        let (_dir, store) = seeded();
+        assert_eq!(
+            positions(&store, &in_blocks(Some(2), Some(2)), Order::Ascending),
+            vec![Position::new(2, 0)],
+        );
+        // Either end open.
+        assert_eq!(
+            positions(&store, &in_blocks(Some(2), None), Order::Ascending),
+            vec![Position::new(2, 0), Position::new(3, 0)],
+        );
+        assert_eq!(
+            positions(&store, &in_blocks(None, Some(1)), Order::Ascending),
+            vec![Position::new(1, 0), Position::new(1, 1)],
+        );
+        // Both ends open is exactly the unbounded walk.
+        assert_eq!(
+            positions(&store, &in_blocks(None, None), Order::Ascending),
+            positions(&store, &Filter::default(), Order::Ascending),
+        );
+    }
+
+    #[test]
+    fn a_block_range_reads_the_same_both_ways() {
+        let (_dir, store) = seeded();
+        let filter = in_blocks(Some(1), Some(2));
+        let mut descending = positions(&store, &filter, Order::Descending);
+        descending.reverse();
+        assert_eq!(descending.len(), 3);
+        assert_eq!(positions(&store, &filter, Order::Ascending), descending);
+    }
+
+    #[test]
+    fn a_block_range_bounds_a_filtered_walk() {
+        // The bound has to hold on the merged path too, where each secondary walk
+        // stops on its own rather than one primary scan stopping for everyone.
+        let (_dir, store) = seeded();
+        let filter = Filter {
+            from: Some(addr(0xaa)),
+            blocks: BlockRange::new(None, Some(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            positions(&store, &filter, Order::Ascending),
+            vec![Position::new(1, 0), Position::new(1, 1)],
+            "0xaa also sends in block 3, outside the range",
+        );
+    }
+
+    #[test]
+    fn an_impossible_range_selects_nothing() {
+        let (_dir, store) = seeded();
+        // Past the tip, and a max below its own min.
+        for filter in [in_blocks(Some(10), Some(20)), in_blocks(Some(3), Some(1))] {
+            for order in [Order::Ascending, Order::Descending] {
+                assert!(positions(&store, &filter, order).is_empty(), "{filter:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_range_and_a_cursor_take_the_tighter_bound() {
+        // Both say where to begin. Honouring only the cursor walks out of the range;
+        // honouring only the range replays rows the cursor already returned.
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        let at = |filter: Filter, after, order| {
+            reader
+                .query(&filter, Some(after), order, MAX_LIMIT)
+                .unwrap()
+                .iter()
+                .map(|t| t.position)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            at(
+                in_blocks(Some(3), None),
+                Position::new(1, 0),
+                Order::Ascending
+            ),
+            vec![Position::new(3, 0)],
+            "the range is the tighter opening",
+        );
+        assert_eq!(
+            at(
+                in_blocks(Some(1), Some(2)),
+                Position::new(1, 0),
+                Order::Ascending
+            ),
+            vec![Position::new(1, 1), Position::new(2, 0)],
+            "the cursor is the tighter opening, and the range still ends the walk",
+        );
+        assert_eq!(
+            at(
+                in_blocks(None, Some(1)),
+                Position::new(3, 0),
+                Order::Descending
+            ),
+            vec![Position::new(1, 1), Position::new(1, 0)],
+            "descending, the range's max is the tighter opening",
+        );
+    }
+
+    #[test]
+    fn paging_within_a_range_stays_inside_it() {
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        let filter = in_blocks(Some(1), Some(2));
+        let all = reader
+            .page(&filter, None, Order::Ascending, Some(MAX_LIMIT))
+            .unwrap();
+        let (mut seen, mut cursor) = (Vec::new(), None);
+        for _ in 0..=all.rows.len() {
+            let page = reader
+                .page(&filter, cursor.as_deref(), Order::Ascending, Some(1))
+                .unwrap();
+            seen.extend(page.rows);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the cursor never ran out");
+        assert_eq!(seen, all.rows);
+        assert!(seen.iter().all(|row| row.position.block_num <= 2));
+    }
+
+    #[test]
+    fn a_gallop_stops_at_the_range_rather_than_seeking_past_it() {
+        // The one place a range and the intersection meet: `advance_to` gives up
+        // stepping and seeks straight to its target, and that target can sit outside
+        // the range. Checking the bound only where the walk *starts* would let the
+        // seek land beyond it and serve a row the caller excluded.
+        let (_dir, mut store) = empty();
+        // Filler to the shared recipient, more than GALLOP_AFTER of it, so the
+        // recipient's walk gives up stepping and seeks.
+        let mut rows: Vec<_> = (1..=39).map(|b| tx(b, 0, 0xbb, Some(0xcc), 2)).collect();
+        // The rare sender inside the range, but paying someone else: the seek target
+        // is in range while the entry the recipient's walk lands on is not.
+        rows.push(tx(40, 0, 0x0a, Some(0xdd), 2));
+        // The pair's only real meeting, past the range's end.
+        rows.push(tx(60, 0, 0x0a, Some(0xcc), 2));
+        store.apply(&plan(None, rows, tip(60))).unwrap();
+
+        let filter = |blocks| Filter {
+            from: Some(addr(0x0a)),
+            to: Some(addr(0xcc)),
+            blocks,
+            ..Default::default()
+        };
+        assert_eq!(
+            positions(&store, &filter(BlockRange::default()), Order::Ascending),
+            vec![Position::new(60, 0)],
+            "unbounded, the gallop finds it",
+        );
+        assert!(
+            positions(
+                &store,
+                &filter(BlockRange::new(None, Some(50))),
+                Order::Ascending
+            )
+            .is_empty(),
+            "the seek landed past the range's end and the walk must stop there",
+        );
     }
 
     #[test]
