@@ -22,7 +22,7 @@ use std::sync::Arc;
 use alloy_primitives::{Address, TxHash, B256};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DBIteratorWithThreadMode, Direction, IteratorMode,
-    Options, WriteBatch, DB,
+    Options, Snapshot, WriteBatch, DB,
 };
 
 /// Ordering direction for a query, mirroring the RPC's `sort.order`.
@@ -352,22 +352,41 @@ impl Reader {
         order: Order,
         limit: usize,
     ) -> eyre::Result<Vec<IndexedTx>> {
+        // One snapshot for the whole page: a query is several reads — a walk per
+        // filtered keyspace, then a lookup per row — and a revert committing
+        // mid-query would delete a row a walk already named, turning its lookup
+        // into an error. Pinning one commit makes the page the answer as of a moment.
+        self.query_at(&self.db.snapshot(), filter, after, order, limit)
+    }
+
+    fn query_at(
+        &self,
+        snapshot: &Snapshot<'_>,
+        filter: &Filter,
+        after: Option<Position>,
+        order: Order,
+        limit: usize,
+    ) -> eyre::Result<Vec<IndexedTx>> {
+        // Every walk reads the same snapshot, cursor and direction; only the
+        // keyspace and its prefix differ.
+        let walk = |cf, prefix: &[u8]| scan(&self.db, snapshot, cf, prefix, after, order);
+
         let mut scans = Vec::new();
         if let Some(from) = filter.from {
-            scans.push(scan(&self.db, CF_FROM, from.as_slice(), after, order)?);
+            scans.push(walk(CF_FROM, from.as_slice())?);
         }
         if let Some(to) = filter.to {
-            scans.push(scan(&self.db, CF_TO, to.as_slice(), after, order)?);
+            scans.push(walk(CF_TO, to.as_slice())?);
         }
         if let Some(ty) = filter.tx_type {
-            scans.push(scan(&self.db, CF_TYPE, &[ty], after, order)?);
+            scans.push(walk(CF_TYPE, &[ty])?);
         }
 
         let primary = self.db.cf_handle(CF_PRIMARY).expect("cf created at open");
 
         // No filters: walk the primary directly — its values are the rows.
         if scans.is_empty() {
-            let mut walk = scan(&self.db, CF_PRIMARY, &[], after, order)?;
+            let mut walk = walk(CF_PRIMARY, &[])?;
             let mut out = Vec::with_capacity(limit);
             while out.len() < limit {
                 let Some((pos, val)) = walk.next_entry()? else {
@@ -382,7 +401,7 @@ impl Reader {
         let positions = merge(scans, order, limit)?;
         let keys = positions.iter().map(|&p| (&primary, pos_key(p)));
         let mut out = Vec::with_capacity(positions.len());
-        for (pos, got) in positions.iter().zip(self.db.multi_get_cf(keys)) {
+        for (pos, got) in positions.iter().zip(snapshot.multi_get_cf(keys)) {
             let val = got?.ok_or_else(|| eyre::eyre!("secondary entry points at a missing row"))?;
             out.push(decode_row(*pos, &val)?);
         }
@@ -477,7 +496,7 @@ const GALLOP_AFTER: usize = 16;
 /// entry's position and value — the value matters on the primary keyspace, where it
 /// is the row itself and saves a point lookup per hit.
 struct KeyScan<'a> {
-    db: &'a DB,
+    snapshot: &'a Snapshot<'a>,
     cf: &'a ColumnFamily,
     it: DBIteratorWithThreadMode<'a, DB>,
     prefix: Vec<u8>,
@@ -530,8 +549,10 @@ impl KeyScan<'_> {
             Order::Ascending => Direction::Forward,
             Order::Descending => Direction::Reverse,
         };
+        // Re-seek within the same snapshot, so a gallop cannot step from one
+        // commit into the next.
         self.it = self
-            .db
+            .snapshot
             .iterator_cf(self.cf, IteratorMode::From(&key, direction));
         self.next_pos()
     }
@@ -539,6 +560,7 @@ impl KeyScan<'_> {
 
 fn scan<'a>(
     db: &'a DB,
+    snapshot: &'a Snapshot<'a>,
     cf: &str,
     prefix: &[u8],
     after: Option<Position>,
@@ -565,9 +587,9 @@ fn scan<'a>(
         Order::Descending => Direction::Reverse,
     };
     Ok(KeyScan {
-        db,
+        snapshot,
         cf: handle,
-        it: db.iterator_cf(handle, IteratorMode::From(&start, direction)),
+        it: snapshot.iterator_cf(handle, IteratorMode::From(&start, direction)),
         prefix: prefix.to_vec(),
         order,
         skip,
@@ -997,6 +1019,37 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(read_tip(&reader.db).unwrap(), tip(1));
+    }
+
+    #[test]
+    fn a_page_reads_one_commit_even_as_the_writer_reverts() {
+        // Without a pinned snapshot, a revert landing mid-query deletes a row the
+        // walk already named, and its lookup errors — on the path every reorg takes.
+        let (_dir, mut store) = seeded();
+        let reader = store.reader();
+        let snapshot = reader.db.snapshot();
+
+        // Everything the query is about to name is dropped *after* it is pinned.
+        store.apply(&plan(Some(1), vec![], tip(0))).unwrap();
+
+        let filter = Filter {
+            from: Some(addr(0xaa)),
+            ..Default::default()
+        };
+        let pinned = reader
+            .query_at(&snapshot, &filter, None, Order::Ascending, 10)
+            .unwrap();
+        assert_eq!(
+            pinned.len(),
+            3,
+            "the walk and the lookups that resolve it must read the same commit"
+        );
+
+        // A query started afterwards pins the later commit, and sees the revert.
+        assert!(reader
+            .query(&filter, None, Order::Ascending, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
