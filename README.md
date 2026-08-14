@@ -32,6 +32,11 @@ sorted ranges rather than by loading and sorting.
 A block range is not a fourth keyspace for the same reason: every key already ends in
 `block‖idx`, so `fromBlock`/`toBlock` is where each walk seeks to and where it stops.
 
+Neither is "did this address take part", the first query a wallet makes: it is the
+`from` and `to` walks unioned — the same sorted merge as the intersection around it. A
+keyspace of its own would answer it in one walk instead of two, but cost an extra entry
+per transaction on every write; the read is the cheaper side to pay on.
+
 Rows hold positions and filter keys, never transaction bodies — the node already stores
 those. Disk grows with transaction *count* rather than size, and the index can be deleted
 and rebuilt without touching the node's own state.

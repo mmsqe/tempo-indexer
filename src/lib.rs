@@ -100,6 +100,9 @@ impl BlockRange {
 pub struct Filter {
     pub from: Option<Address>,
     pub to: Option<Address>,
+    /// Either side: transactions this address sent *or* received — one query
+    /// rather than two merged by the caller.
+    pub address: Option<Address>,
     pub tx_type: Option<u8>,
     /// The heights to walk. Not a keyspace of its own: every key already ends in
     /// `block‖idx`, so a range is where each walk starts and stops.
@@ -391,21 +394,31 @@ impl Reader {
         let walk =
             |cf, prefix: &[u8]| scan(&self.db, snapshot, cf, prefix, after, filter.blocks, order);
 
-        let mut scans = Vec::new();
+        // One term per filter, intersected. Only `address` is more than one walk.
+        let mut terms = Vec::new();
         if let Some(from) = filter.from {
-            scans.push(walk(CF_FROM, from.as_slice())?);
+            terms.push(Term::new(vec![walk(CF_FROM, from.as_slice())?], order)?);
         }
         if let Some(to) = filter.to {
-            scans.push(walk(CF_TO, to.as_slice())?);
+            terms.push(Term::new(vec![walk(CF_TO, to.as_slice())?], order)?);
+        }
+        if let Some(address) = filter.address {
+            terms.push(Term::new(
+                vec![
+                    walk(CF_FROM, address.as_slice())?,
+                    walk(CF_TO, address.as_slice())?,
+                ],
+                order,
+            )?);
         }
         if let Some(ty) = filter.tx_type {
-            scans.push(walk(CF_TYPE, &[ty])?);
+            terms.push(Term::new(vec![walk(CF_TYPE, &[ty])?], order)?);
         }
 
         let primary = self.db.cf_handle(CF_PRIMARY).expect("cf created at open");
 
         // No filters: walk the primary directly — its values are the rows.
-        if scans.is_empty() {
+        if terms.is_empty() {
             let mut walk = walk(CF_PRIMARY, &[])?;
             let mut out = Vec::with_capacity(limit);
             while out.len() < limit {
@@ -418,7 +431,7 @@ impl Reader {
         }
 
         // Filtered: merge the secondary walks, then resolve rows from the primary.
-        let positions = merge(scans, order, limit)?;
+        let positions = merge(terms, order, limit)?;
         let keys = positions.iter().map(|&p| (&primary, pos_key(p)));
         let mut out = Vec::with_capacity(positions.len());
         for (pos, got) in positions.iter().zip(snapshot.multi_get_cf(keys)) {
@@ -639,32 +652,93 @@ fn scan<'a>(
     })
 }
 
-/// Intersect 1..=3 keyspace walks by sorted merge — every secondary shares the
-/// `block‖idx` suffix ordering, which is what makes `AND` a merge at all.
-fn merge(mut scans: Vec<KeyScan<'_>>, order: Order, limit: usize) -> eyre::Result<Vec<Position>> {
-    let mut heads = Vec::with_capacity(scans.len());
-    for s in &mut scans {
-        heads.push(s.next_pos()?);
+/// One `AND` term of a query: a union of keyspace walks, yielding each position
+/// once however many of them hold it.
+///
+/// Most filters are one walk. `address` is why the type exists: "sent *or*
+/// received" is the `from` and `to` walks unioned — a second walk at read time
+/// rather than a keyspace of its own and the writes to keep it in step. Every walk
+/// yields in `block‖idx` order, so a union is a merge like the intersection
+/// around it.
+struct Term<'a> {
+    scans: Vec<KeyScan<'a>>,
+    /// Each walk's current position, `None` once it is exhausted.
+    heads: Vec<Option<Position>>,
+    order: Order,
+}
+
+impl<'a> Term<'a> {
+    fn new(mut scans: Vec<KeyScan<'a>>, order: Order) -> eyre::Result<Self> {
+        let heads = scans
+            .iter_mut()
+            .map(KeyScan::next_pos)
+            .collect::<eyre::Result<_>>()?;
+        Ok(Self {
+            scans,
+            heads,
+            order,
+        })
     }
+
+    /// The position this term yields next — the *least* advanced of its walks.
+    /// `None` once every walk is spent.
+    fn head(&self) -> Option<Position> {
+        let heads = self.heads.iter().flatten().copied();
+        match self.order {
+            Order::Descending => heads.max(),
+            Order::Ascending => heads.min(),
+        }
+    }
+
+    /// Step every walk sitting on `pos` past it. Advancing them together is what
+    /// makes the union yield a position once: a transaction from an address to
+    /// itself is in both walks.
+    fn advance_past(&mut self, pos: Position) -> eyre::Result<()> {
+        for (head, scan) in self.heads.iter_mut().zip(&mut self.scans) {
+            if *head == Some(pos) {
+                *head = scan.next_pos()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gallop every walk still short of `target` up to it, and report the new head.
+    fn advance_to(&mut self, target: Position) -> eyre::Result<Option<Position>> {
+        for (head, scan) in self.heads.iter_mut().zip(&mut self.scans) {
+            if head.is_some_and(|pos| scan.still_ahead(pos, target)) {
+                *head = scan.advance_to(target)?;
+            }
+        }
+        Ok(self.head())
+    }
+}
+
+/// Intersect the terms by sorted merge — every keyspace shares the `block‖idx` suffix
+/// ordering, which is what makes `AND` a merge at all.
+fn merge(mut terms: Vec<Term<'_>>, order: Order, limit: usize) -> eyre::Result<Vec<Position>> {
     let mut out = Vec::new();
-    while out.len() < limit && heads.iter().all(Option::is_some) {
-        // The head *least* far along is the meeting point: anything ahead of it can
-        // gallop straight down to it, and when every head sits on it, that position
-        // is in the intersection.
-        let iter = heads.iter().flatten();
-        let target = match order {
-            Order::Descending => *iter.min().unwrap(),
-            Order::Ascending => *iter.max().unwrap(),
+    while out.len() < limit {
+        // An exhausted term ends the walk: nothing further can be in every term.
+        let Some(heads) = terms.iter().map(Term::head).collect::<Option<Vec<_>>>() else {
+            break;
         };
-        if heads.iter().all(|h| *h == Some(target)) {
+        // The *most* advanced head is the meeting point: anything behind it can
+        // gallop straight to it, and when every head sits on it, that position is
+        // in the intersection.
+        let target = match order {
+            Order::Descending => heads.iter().copied().min(),
+            Order::Ascending => heads.iter().copied().max(),
+        };
+        let Some(target) = target else { break };
+        if heads.iter().all(|&head| head == target) {
             out.push(target);
-            for (head, s) in heads.iter_mut().zip(&mut scans) {
-                *head = s.next_pos()?;
+            for term in &mut terms {
+                term.advance_past(target)?;
             }
         } else {
-            for (head, s) in heads.iter_mut().zip(&mut scans) {
-                if *head != Some(target) {
-                    *head = s.advance_to(target)?;
+            for term in &mut terms {
+                if term.head() != Some(target) {
+                    term.advance_to(target)?;
                 }
             }
         }
@@ -804,6 +878,149 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].position, Position::new(1, 0));
+    }
+
+    #[test]
+    fn an_address_matches_either_side() {
+        // What a wallet's default screen asks. 0xbb receives in block 1 and sends in
+        // block 2; either query alone sees half of that.
+        let (_dir, store) = seeded();
+        let by = |address| Filter {
+            address: Some(addr(address)),
+            ..Default::default()
+        };
+        assert_eq!(
+            positions(&store, &by(0xbb), Order::Ascending),
+            vec![Position::new(1, 0), Position::new(2, 0)],
+        );
+        // And it is exactly the union of the two one-sided queries.
+        let sent = positions(
+            &store,
+            &Filter {
+                from: Some(addr(0xbb)),
+                ..Default::default()
+            },
+            Order::Ascending,
+        );
+        let received = positions(
+            &store,
+            &Filter {
+                to: Some(addr(0xbb)),
+                ..Default::default()
+            },
+            Order::Ascending,
+        );
+        let mut union = [sent, received].concat();
+        union.sort();
+        assert_eq!(positions(&store, &by(0xbb), Order::Ascending), union);
+    }
+
+    #[test]
+    fn an_address_yields_a_transaction_to_itself_once() {
+        // The union's one hazard: a transaction from an address to itself sits in
+        // both walks, and a merge that advanced only one would report it twice.
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![tx(1, 0, 0xee, Some(0xee), 2), tx(2, 0, 0xee, Some(0xff), 2)],
+                tip(2),
+            ))
+            .unwrap();
+        let filter = Filter {
+            address: Some(addr(0xee)),
+            ..Default::default()
+        };
+        for order in [Order::Ascending, Order::Descending] {
+            let mut got = positions(&store, &filter, order);
+            got.sort();
+            assert_eq!(got, vec![Position::new(1, 0), Position::new(2, 0)]);
+        }
+    }
+
+    #[test]
+    fn an_address_intersects_the_other_filters() {
+        // A union is still one `AND` term: everything else narrows it.
+        let (_dir, store) = seeded();
+        assert_eq!(
+            positions(
+                &store,
+                &Filter {
+                    address: Some(addr(0xaa)),
+                    tx_type: Some(0),
+                    ..Default::default()
+                },
+                Order::Ascending,
+            ),
+            vec![Position::new(2, 0)],
+            "0xaa is on four transactions; one is type 0, and it received that one",
+        );
+        assert_eq!(
+            positions(
+                &store,
+                &Filter {
+                    address: Some(addr(0xaa)),
+                    blocks: BlockRange::new(Some(3), None),
+                    ..Default::default()
+                },
+                Order::Ascending,
+            ),
+            vec![Position::new(3, 0)],
+            "the range bounds both walks of the union",
+        );
+    }
+
+    #[test]
+    fn an_address_pages_like_any_other_filter() {
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        let filter = Filter {
+            address: Some(addr(0xaa)),
+            ..Default::default()
+        };
+        for order in [Order::Ascending, Order::Descending] {
+            let all = reader
+                .page(&filter, None, order, Some(MAX_LIMIT))
+                .unwrap()
+                .rows;
+            assert_eq!(all.len(), 4, "0xaa is on every seeded transaction");
+            let (mut seen, mut cursor) = (Vec::new(), None);
+            for _ in 0..=all.len() {
+                let page = reader
+                    .page(&filter, cursor.as_deref(), order, Some(1))
+                    .unwrap();
+                seen.extend(page.rows);
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert!(cursor.is_none(), "the cursor never ran out ({order:?})");
+            assert_eq!(seen, all, "paged result diverged ({order:?})");
+        }
+    }
+
+    #[test]
+    fn an_address_gallops_inside_its_union() {
+        // The union has to gallop like a plain walk does, or intersecting a busy
+        // address against a rare one degrades to scanning the busy side.
+        let (_dir, mut store) = empty();
+        let mut rows: Vec<_> = (1..=40).map(|b| tx(b, 0, 0xbb, Some(0xcc), 2)).collect();
+        rows.push(tx(60, 0, 0x0a, Some(0xcc), 2));
+        store.apply(&plan(None, rows, tip(60))).unwrap();
+
+        let filter = Filter {
+            address: Some(addr(0xcc)),
+            from: Some(addr(0x0a)),
+            ..Default::default()
+        };
+        for order in [Order::Ascending, Order::Descending] {
+            assert_eq!(
+                positions(&store, &filter, order),
+                vec![Position::new(60, 0)],
+                "{order:?}",
+            );
+        }
     }
 
     /// The positions a whole query selects — what a range test is actually about.
