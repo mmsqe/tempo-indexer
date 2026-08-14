@@ -437,13 +437,31 @@ impl Store {
                 .iterator_cf(p, IteratorMode::From(&start, Direction::Forward))
             {
                 let (key, val) = item?;
-                let position = pos_from_key(&key)?;
-                let row = decode_row(position, &val)?;
+                let row = decode_row(pos_from_key(&key)?, &val)?;
                 batch.delete_cf(p, &key);
-                for (name, prefix) in secondaries(&row) {
-                    batch.delete_cf(cf(&self.db, name), sec_key(&prefix, position));
-                }
+                self.forget(&mut batch, &row);
             }
+        }
+
+        // A row put over an occupied position replaces the one stored there, and that
+        // one's entries have to go with it: they are keyed by its values rather than
+        // its position, so nothing else will ever reach them again. Left behind, the
+        // old sender's walk still names the position and hydrates the new row.
+        //
+        // Only below the cut. At or above it the revert above already forgot these
+        // rows, and doing it twice would undo the puts that follow.
+        let cut = plan.revert_from.unwrap_or(u64::MAX);
+        let replacing: Vec<&IndexedTx> = plan
+            .rows
+            .iter()
+            .filter(|row| row.position.block_num < cut)
+            .collect();
+        let stored = self
+            .db
+            .multi_get_cf(replacing.iter().map(|row| (p, pos_key(row.position))));
+        for (row, got) in replacing.iter().zip(stored) {
+            let Some(val) = got? else { continue };
+            self.forget(&mut batch, &decode_row(row.position, &val)?);
         }
 
         for row in &plan.rows {
@@ -465,6 +483,17 @@ impl Store {
         // the recorded tip.
         self.db.write(batch)?;
         Ok(())
+    }
+
+    /// Take a stored row back out of the index: drop the secondary entries it owns. The
+    /// primary row itself is the caller's to drop or overwrite.
+    ///
+    /// One definition, so a revert and a replacement cannot disagree about what a row
+    /// was holding.
+    fn forget(&self, batch: &mut WriteBatch, row: &IndexedTx) {
+        for (name, prefix) in secondaries(row) {
+            batch.delete_cf(cf(&self.db, name), sec_key(&prefix, row.position));
+        }
     }
 
     /// The block the index is caught up to, or `None` before the first notification.
@@ -1804,6 +1833,45 @@ mod tests {
         let mut val = encode_row(&tx(1, 0, 0xaa, None, 2));
         val[53] = HAS_FEE_PAYER;
         assert!(decode_row(Position::new(1, 0), &val).is_err());
+    }
+
+    #[test]
+    fn replacing_a_row_replaces_its_index_entries() {
+        // A put over an occupied position rewrites the row, and the secondary entries
+        // the *old* row put there have to go with it. Left behind, the old sender's
+        // walk still names the position, and hydrating it hands back the new row --
+        // a transaction the filter does not match, reported as though it did.
+        let (_dir, mut store) = seeded();
+        store
+            .apply(&plan(None, vec![tx(3, 0, 0xcc, Some(0xdd), 2)], tip(3)))
+            .unwrap();
+
+        let sent_by_the_old_sender = positions(
+            &store,
+            &Filter {
+                from: Some(addr(0xaa)),
+                ..Default::default()
+            },
+            Order::Ascending,
+        );
+        assert!(
+            !sent_by_the_old_sender.contains(&Position::new(3, 0)),
+            "the replaced row's sender still finds it",
+        );
+        assert_eq!(sent_by_the_old_sender.len(), 2);
+        // The new row's own entries are there: the delete precedes the put, so the
+        // entries both rows share survive rather than cancelling out.
+        assert_eq!(
+            positions(
+                &store,
+                &Filter {
+                    from: Some(addr(0xcc)),
+                    ..Default::default()
+                },
+                Order::Ascending,
+            ),
+            vec![Position::new(3, 0)],
+        );
     }
 
     #[test]
