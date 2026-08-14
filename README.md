@@ -23,6 +23,7 @@ to        to   ‖block‖idx     → ()
 type      type ‖block‖idx     → ()
 fee_token fee_token‖block‖idx → ()
 fee_payer fee_payer‖block‖idx → ()
+count     kind‖0‖value        → u64
 ```
 
 Chain position is the suffix everywhere, because it is the only *total* order
@@ -50,6 +51,11 @@ and where it stops, since every key already ends in `block‖idx`. And "did this
 take part" is the `from` and `to` walks unioned — the same sorted merge as the
 intersection around it; a keyspace of its own would answer in one walk instead of two, at
 an extra entry per transaction on every write, and the read is the cheaper side to pay on.
+
+`count` is the one exception to "a keyspace per filterable column": RocksDB has no cheap
+`COUNT`, so "how many does this address have" is maintained as rows are written. It is
+kept per filter value, so an intersection, or a block range, has no stored answer and
+`Reader::count` says `None` rather than inventing one.
 
 ## Writes are atomic, because reorgs are not rare
 

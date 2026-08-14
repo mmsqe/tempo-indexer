@@ -18,6 +18,7 @@
 //! that recorded only the first target answers with silence. Rows hold positions and
 //! filter keys, never transaction bodies — the node already stores those.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -200,15 +201,23 @@ const CF_TO: &str = "to";
 const CF_TYPE: &str = "type";
 const CF_FEE_TOKEN: &str = "fee_token";
 const CF_FEE_PAYER: &str = "fee_payer";
-const CFS: [&str; 6] = [
+/// Row counts per filter value, so an address page can say how many without paging to
+/// the end of the walk to find out.
+const CF_COUNT: &str = "count";
+const CFS: [&str; 7] = [
     CF_PRIMARY,
     CF_FROM,
     CF_TO,
     CF_TYPE,
     CF_FEE_TOKEN,
     CF_FEE_PAYER,
+    CF_COUNT,
 ];
 
+/// Counter namespaces that no keyspace backs: "took part on either side", which is a
+/// union at read time and so has no single walk to count, and the grand total.
+const COUNT_ADDRESS: &str = "addr";
+const COUNT_TOTAL: &str = "all";
 /// The resume point: one key in the default keyspace, replaced on every applied tip.
 const TIP_KEY: &[u8] = b"tip";
 
@@ -234,7 +243,7 @@ fn pos_from_key(suffix: &[u8]) -> eyre::Result<Position> {
 }
 
 /// The addresses a row calls, without repeats — a batch that names one twice still
-/// owns one entry, and a revert has to delete that entry exactly once.
+/// owns one entry, and deleting that entry once is what a revert has to do.
 fn targets(row: &IndexedTx) -> Vec<Address> {
     let mut out = Vec::with_capacity(row.to.len());
     for to in &row.to {
@@ -258,10 +267,21 @@ fn secondaries(row: &IndexedTx) -> Vec<(&'static str, Vec<u8>)> {
     out
 }
 
+/// `kind ‖ 0 ‖ prefix` — which counter, and what it counts. Names are ASCII, so the
+/// zero byte keeps one namespace from reading as another's prefix.
+fn count_key(kind: &str, prefix: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(kind.len() + 1 + prefix.len());
+    k.extend_from_slice(kind.as_bytes());
+    k.push(0);
+    k.extend_from_slice(prefix);
+    k
+}
+
 /// The filters one walk answers, as the keyspace and prefix to walk.
 ///
-/// One list, so a column becomes filterable in one edit. `address` is not in it: it is
-/// a union of two walks, with no keyspace of its own.
+/// Read by the query and the count alike, so a column becomes filterable and countable
+/// in one edit. `address` is in neither: it is a union of two walks, with no keyspace
+/// of its own.
 fn columns(filter: &Filter) -> Vec<(&'static str, Vec<u8>)> {
     [
         filter.from.map(|a| (CF_FROM, a.to_vec())),
@@ -273,6 +293,22 @@ fn columns(filter: &Filter) -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Every counter a row contributes to: one per [`secondaries`] entry, plus the two no
+/// keyspace holds — taking part on either side, and the total.
+fn counters(row: &IndexedTx) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = secondaries(row)
+        .iter()
+        .map(|(name, prefix)| count_key(name, prefix))
+        .collect();
+    // Once per distinct participant: a transaction from an address to itself took part
+    // once, and counting it twice would disagree with what the union yields.
+    let participants =
+        std::iter::once(row.from).chain(targets(row).into_iter().filter(|to| *to != row.from));
+    out.extend(participants.map(|address| count_key(COUNT_ADDRESS, address.as_slice())));
+    out.push(count_key(COUNT_TOTAL, &[]));
+    out
 }
 
 fn sec_key(prefix: &[u8], pos: Position) -> Vec<u8> {
@@ -363,6 +399,13 @@ fn decode_row(position: Position, val: &[u8]) -> eyre::Result<IndexedTx> {
     })
 }
 
+fn decode_count(val: &[u8]) -> eyre::Result<u64> {
+    let bytes = val
+        .try_into()
+        .map_err(|_| eyre::eyre!("count value: expected 8 bytes, found {}", val.len()))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
 fn decode_tip(val: &[u8]) -> eyre::Result<Tip> {
     if val.len() != 40 {
         eyre::bail!("tip value: expected 40 bytes, found {}", val.len());
@@ -429,6 +472,7 @@ impl Store {
     pub fn apply(&mut self, plan: &Plan) -> eyre::Result<()> {
         let p = cf(&self.db, CF_PRIMARY);
         let mut batch = WriteBatch::default();
+        let mut deltas: HashMap<Vec<u8>, i64> = HashMap::new();
 
         if let Some(from_block) = plan.revert_from {
             let start = pos_key(Position::new(from_block, 0));
@@ -439,7 +483,7 @@ impl Store {
                 let (key, val) = item?;
                 let row = decode_row(pos_from_key(&key)?, &val)?;
                 batch.delete_cf(p, &key);
-                self.forget(&mut batch, &row);
+                self.forget(&mut batch, &mut deltas, &row);
             }
         }
 
@@ -461,13 +505,31 @@ impl Store {
             .multi_get_cf(replacing.iter().map(|row| (p, pos_key(row.position))));
         for (row, got) in replacing.iter().zip(stored) {
             let Some(val) = got? else { continue };
-            self.forget(&mut batch, &decode_row(row.position, &val)?);
+            self.forget(&mut batch, &mut deltas, &decode_row(row.position, &val)?);
         }
 
         for row in &plan.rows {
             batch.put_cf(p, pos_key(row.position), encode_row(row));
             for (name, prefix) in secondaries(row) {
                 batch.put_cf(cf(&self.db, name), sec_key(&prefix, row.position), []);
+            }
+            for counter in counters(row) {
+                *deltas.entry(counter).or_default() += 1;
+            }
+        }
+
+        // Read-modify-write, which only a `Store` may do and only one of those exists.
+        // The counts land in the same batch as the rows they describe, so a crash
+        // cannot leave one without the other.
+        let counts = cf(&self.db, CF_COUNT);
+        let current = self.db.multi_get_cf(deltas.keys().map(|key| (counts, key)));
+        for ((key, delta), got) in deltas.iter().zip(current) {
+            let now = got?.as_deref().map(decode_count).transpose()?.unwrap_or(0);
+            // Saturating rather than failing: a count is derived data, and stopping the
+            // indexer over one would cost more than the wrong number does.
+            match now.saturating_add_signed(*delta) {
+                0 => batch.delete_cf(counts, key),
+                next => batch.put_cf(counts, key, next.to_be_bytes()),
             }
         }
 
@@ -485,14 +547,17 @@ impl Store {
         Ok(())
     }
 
-    /// Take a stored row back out of the index: drop the secondary entries it owns. The
-    /// primary row itself is the caller's to drop or overwrite.
+    /// Take a stored row back out of the index: drop the secondary entries it owns and
+    /// discount it. The primary row itself is the caller's to drop or overwrite.
     ///
-    /// One definition, so a revert and a replacement cannot disagree about what a row
-    /// was holding.
-    fn forget(&self, batch: &mut WriteBatch, row: &IndexedTx) {
+    /// The one place a row stops counting, so a revert and a replacement cannot come to
+    /// disagree about what a row was holding.
+    fn forget(&self, batch: &mut WriteBatch, deltas: &mut HashMap<Vec<u8>, i64>, row: &IndexedTx) {
         for (name, prefix) in secondaries(row) {
             batch.delete_cf(cf(&self.db, name), sec_key(&prefix, row.position));
+        }
+        for counter in counters(row) {
+            *deltas.entry(counter).or_default() -= 1;
         }
     }
 
@@ -577,6 +642,46 @@ impl Reader {
             out.push(decode_row(*pos, &val)?);
         }
         Ok(out)
+    }
+}
+
+impl Reader {
+    /// How many rows a filter selects, without walking to the end to find out.
+    ///
+    /// `None` where no counter answers the filter — counts are kept per filter value as
+    /// rows are written, so an intersection of two, or a block range, has no stored
+    /// answer, and producing one by walking is the scan a count exists to avoid. An
+    /// address page asks a single term, which is the case this serves.
+    ///
+    /// Read on its own, so a page fetched separately can disagree by whatever committed
+    /// in between — the staleness any two calls have.
+    pub fn count(&self, filter: &Filter) -> eyre::Result<Option<u64>> {
+        if filter.blocks != BlockRange::default() {
+            return Ok(None);
+        }
+        let mut terms: Vec<Vec<u8>> = columns(filter)
+            .iter()
+            .map(|(name, prefix)| count_key(name, prefix))
+            .collect();
+        if let Some(address) = filter.address {
+            terms.push(count_key(COUNT_ADDRESS, address.as_slice()));
+        }
+        let key = match terms.len() {
+            0 => count_key(COUNT_TOTAL, &[]),
+            1 => terms.remove(0),
+            // An intersection: each side is counted, their overlap is not.
+            _ => return Ok(None),
+        };
+        let stored = self.db.get_cf(cf(&self.db, CF_COUNT), key)?;
+        // Absent is zero: a counter is only written once something is counted, and
+        // deleted again when it falls back to nothing.
+        Ok(Some(
+            stored
+                .as_deref()
+                .map(decode_count)
+                .transpose()?
+                .unwrap_or(0),
+        ))
     }
 }
 
@@ -1681,6 +1786,47 @@ mod tests {
         assert_eq!(canonical.len(), 1);
     }
 
+    /// The invariant every count test wants: what the counter reports is what the walk
+    /// yields. Kept as one helper so no test can check the number without checking that.
+    fn assert_count_matches_walk(store: &Store, filter: &Filter) {
+        let reader = store.reader();
+        let walked = reader
+            .query(filter, None, Order::Ascending, MAX_LIMIT)
+            .unwrap()
+            .len();
+        assert_eq!(
+            reader.count(filter).unwrap(),
+            Some(walked as u64),
+            "the count disagreed with the walk for {filter:?}",
+        );
+    }
+
+    /// Every filter the seeded store has a counter for.
+    fn counted_filters() -> Vec<Filter> {
+        let mut filters = vec![Filter::default()];
+        for byte in [0xaa, 0xbb, 0xcc, 0xdd] {
+            filters.push(Filter {
+                from: Some(addr(byte)),
+                ..Default::default()
+            });
+            filters.push(Filter {
+                to: Some(addr(byte)),
+                ..Default::default()
+            });
+            filters.push(Filter {
+                address: Some(addr(byte)),
+                ..Default::default()
+            });
+        }
+        for tx_type in [0, 2, 0x76] {
+            filters.push(Filter {
+                tx_type: Some(tx_type),
+                ..Default::default()
+            });
+        }
+        filters
+    }
+
     #[test]
     fn the_fee_payer_and_fee_token_are_filterable() {
         let (_dir, mut store) = empty();
@@ -1728,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fee_columns_intersect_like_the_others() {
+    fn the_fee_columns_intersect_and_count_like_the_others() {
         let (_dir, mut store) = empty();
         store
             .apply(&plan(
@@ -1753,6 +1899,18 @@ mod tests {
             ),
             vec![Position::new(1, 0)],
         );
+        for filter in [
+            Filter {
+                fee_payer: Some(addr(0xf0)),
+                ..Default::default()
+            },
+            Filter {
+                fee_token: Some(addr(0xe1)),
+                ..Default::default()
+            },
+        ] {
+            assert_count_matches_walk(&store, &filter);
+        }
     }
 
     #[test]
@@ -1781,6 +1939,7 @@ mod tests {
                 positions(&store, &filter, Order::Ascending).is_empty(),
                 "the revert left a ghost behind {filter:?}",
             );
+            assert_eq!(store.reader().count(&filter).unwrap(), Some(0));
         }
     }
 
@@ -1833,6 +1992,117 @@ mod tests {
         let mut val = encode_row(&tx(1, 0, 0xaa, None, 2));
         val[53] = HAS_FEE_PAYER;
         assert!(decode_row(Position::new(1, 0), &val).is_err());
+    }
+
+    #[test]
+    fn a_count_is_what_the_walk_would_yield() {
+        let (_dir, store) = seeded();
+        for filter in counted_filters() {
+            assert_count_matches_walk(&store, &filter);
+        }
+    }
+
+    #[test]
+    fn a_revert_gives_back_what_it_counted() {
+        let (_dir, mut store) = seeded();
+        store.apply(&plan(Some(2), vec![], tip(1))).unwrap();
+        for filter in counted_filters() {
+            assert_count_matches_walk(&store, &filter);
+        }
+        // And back to nothing once every row is gone -- not merely consistent with an
+        // empty walk, which it would be at any number, but actually zero.
+        store.apply(&plan(Some(0), vec![], None)).unwrap();
+        assert_eq!(store.reader().count(&Filter::default()).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn reapplying_a_block_does_not_inflate_the_count() {
+        // The index is idempotent under a repeated put; a counter is not. A
+        // notification redelivered after a restart must not double what it counts.
+        let (_dir, mut store) = seeded();
+        store
+            .apply(&plan(None, vec![tx(1, 0, 0xaa, Some(0xbb), 2)], tip(3)))
+            .unwrap();
+        for filter in counted_filters() {
+            assert_count_matches_walk(&store, &filter);
+        }
+    }
+
+    #[test]
+    fn a_reorg_counts_the_replacement_rather_than_both() {
+        let (_dir, mut store) = seeded();
+        store
+            .apply(&plan(Some(2), vec![tx(2, 0, 0xdd, Some(0xee), 2)], tip(2)))
+            .unwrap();
+        for filter in counted_filters() {
+            assert_count_matches_walk(&store, &filter);
+        }
+        assert_eq!(
+            store
+                .reader()
+                .count(&Filter {
+                    from: Some(addr(0xbb)),
+                    ..Default::default()
+                })
+                .unwrap(),
+            Some(0),
+            "the orphan's sender is still counted",
+        );
+    }
+
+    #[test]
+    fn a_batch_counts_once_per_distinct_participant() {
+        let (_dir, mut store) = empty();
+        // The same target twice, and a sender who is also a target.
+        store
+            .apply(&plan(
+                None,
+                vec![batch(1, 0, 0xaa, &[0xc1, 0xc1, 0xaa], 0x76)],
+                tip(1),
+            ))
+            .unwrap();
+        let reader = store.reader();
+        for byte in [0xaa, 0xc1] {
+            assert_eq!(
+                reader
+                    .count(&Filter {
+                        address: Some(addr(byte)),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                Some(1),
+                "{byte:#x} took part in one transaction",
+            );
+        }
+        assert_eq!(reader.count(&Filter::default()).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn no_counter_answers_more_than_one_term() {
+        // Counters are kept per filter value, so an intersection or a range has no
+        // stored answer. Saying so beats inventing one by walking.
+        let (_dir, store) = seeded();
+        let reader = store.reader();
+        assert_eq!(
+            reader
+                .count(&Filter {
+                    from: Some(addr(0xaa)),
+                    tx_type: Some(2),
+                    ..Default::default()
+                })
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            reader
+                .count(&Filter {
+                    from: Some(addr(0xaa)),
+                    blocks: BlockRange::new(Some(1), None),
+                    ..Default::default()
+                })
+                .unwrap(),
+            None,
+        );
     }
 
     #[test]
@@ -2231,6 +2501,18 @@ mod tests {
                 .reader()
                 .query(&filter, None, Order::Ascending, MAX_LIMIT);
             assert_eq!(seq.unwrap(), mrg.unwrap());
+        }
+        // And the counts netted out the same, which is the half a fold can get wrong
+        // without the walk showing it: a reorg discounts the rows it drops and counts
+        // their replacements, and one merged apply has to land where five separate
+        // ones did.
+        for filter in counted_filters() {
+            assert_count_matches_walk(&sequential, &filter);
+            assert_eq!(
+                sequential.reader().count(&filter).unwrap(),
+                merged_store.reader().count(&filter).unwrap(),
+                "the fold and the replay disagree on {filter:?}",
+            );
         }
     }
 }
