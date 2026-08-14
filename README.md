@@ -35,9 +35,13 @@ and rebuilt without touching the node's own state.
 
 ## Writes are atomic, because reorgs are not rare
 
-`apply` takes a revert, a batch of rows and a tip, and commits them together. A crash
-between a revert and its commit would otherwise leave orphaned rows under a tip claiming
-they are current — a corruption no later write repairs.
+`apply` takes one `Plan` — a revert, a batch of rows and a tip — and commits it whole. A
+crash between a revert and its commit would otherwise leave orphaned rows under a tip
+claiming they are current — a corruption no later write repairs.
+
+A watcher that has fallen behind folds every queued plan into one (`Plan::merge`) and
+applies that: notifications can arrive faster than a write apiece can drain them, and
+one merged apply leaves the index exactly where replaying each plan in order would.
 
 The stored tip carries its block *hash*, not just a height. A node resuming after a
 restart resolves where to continue from by hash, and after a reorg the block at a given
@@ -46,12 +50,12 @@ height is a different one.
 ## Usage
 
 ```rust
-let store = tx_index::Store::open(datadir.join("indexer"))?;
+let mut store = tx_index::Store::open(datadir.join("indexer"))?;
 let reader = store.reader();          // lock-free, cloneable, cannot write
 
-store.apply(revert_from, &rows, tip)?;
+store.apply(&plan)?;                  // one notification's revert, rows and tip
 
-let page = reader.query(&filter, after, tx_index::Order::Descending, 100)?;
+let page = reader.page(&filter, cursor, tx_index::Order::Descending, Some(100))?;
 ```
 
 `Store` is the writing half and does not clone, so "sole writer" is the type system's
@@ -64,6 +68,6 @@ each caller.
 
 ## Tests
 
-`cargo test` — 21 tests over the keyspace layout, cursor round-tripping, filter
-intersection, reorg handling and tip resumption. No network and no node: the store is
+`cargo test` — the keyspace layout, cursor round-tripping, filter intersection, paging,
+reorg handling, plan folding and tip resumption. No network and no node: the store is
 exercised directly.
