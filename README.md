@@ -71,6 +71,17 @@ The stored tip carries its block *hash*, not just a height. A node resuming afte
 restart resolves where to continue from by hash, and after a reorg the block at a given
 height is a different one.
 
+## The layout is versioned, because the answer is always "rebuild"
+
+Beside the tip sits the layout version the index was written with. An on-disk change has
+one answer — delete the index and let the node rebuild — and the only question is when
+the operator finds out. Unversioned, that is a decode error on whichever query first
+reads an older row, which the node serves as a 500 on a request that looks ordinary.
+`Store::open` checks the version instead, so it is one error before anything is served.
+
+Bump on a new keyspace, a new flag bit or a different row shape; not on a new value in an
+existing keyspace.
+
 ## Usage
 
 ```rust
@@ -105,5 +116,5 @@ ahead of what is reachable until that automatic compaction catches up.
 ## Tests
 
 `cargo test` — the keyspace layout, cursor round-tripping, filter intersection, paging,
-reorg handling, plan folding and tip resumption. No network and no node: the store is
-exercised directly.
+reorg handling, plan folding, tip resumption and the layout check. No network and no
+node: the store is exercised directly.

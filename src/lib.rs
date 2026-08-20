@@ -17,6 +17,10 @@
 //! one `to` entry per distinct address it calls, because a chain may batch and an index
 //! that recorded only the first target answers with silence. Rows hold positions and
 //! filter keys, never transaction bodies — the node already stores those.
+//!
+//! Beside the resume tip sits the [`LAYOUT`] the index was written with. The index is
+//! derived data, so any on-disk change means deleting and rebuilding it; the version is
+//! what makes that one error at open instead of a decode error mid-query.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -220,6 +224,19 @@ const COUNT_ADDRESS: &str = "addr";
 const COUNT_TOTAL: &str = "all";
 /// The resume point: one key in the default keyspace, replaced on every applied tip.
 const TIP_KEY: &[u8] = b"tip";
+/// The layout the index was written with, beside the tip. Written once, at creation.
+const LAYOUT_KEY: &[u8] = b"layout";
+
+/// The on-disk layout this build reads and writes.
+///
+/// The index is derived data, so a layout change has one answer — delete it and let the
+/// node rebuild — and the only question is when the operator finds out. Unversioned,
+/// that is a decode error on whichever query first reads an older row, which a node
+/// serves as a 500. Versioned, it is one error at open, before anything is served.
+///
+/// Bump on a new keyspace, a new flag bit or a different row shape; not on a new value
+/// in an existing keyspace. Public so a node can log what it opened.
+pub const LAYOUT: u32 = 1;
 
 /// `block u64 BE ‖ idx u32 BE` — the primary key and every secondary's suffix.
 fn pos_key(pos: Position) -> [u8; 12] {
@@ -329,8 +346,8 @@ const KNOWN_FLAGS: u8 = HAS_FEE_TOKEN | HAS_FEE_PAYER;
 fn row_error(len: usize) -> eyre::Report {
     eyre::eyre!(
         "row value: {len} bytes is not a {ROW_HEADER}-byte header, its flagged \
-         addresses and whole call targets -- an index written by an older layout has \
-         to be deleted and rebuilt",
+         addresses and whole call targets -- the index opened as layout {LAYOUT}, so \
+         this row is corrupt rather than another layout's: delete it and rebuild",
     )
 }
 
@@ -435,7 +452,8 @@ pub struct Reader {
 }
 
 impl Store {
-    /// Open (creating if absent) the index at `path`.
+    /// Open (creating if absent) the index at `path`, refusing one written by a layout
+    /// this build does not read. See [`LAYOUT`].
     pub fn open(path: impl AsRef<Path>) -> eyre::Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -447,6 +465,7 @@ impl Store {
             ColumnFamilyDescriptor::new(name, o)
         });
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;
+        check_layout(&db)?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -787,6 +806,48 @@ fn cf<'a>(db: &'a DB, name: &str) -> &'a ColumnFamily {
 
 fn read_tip(db: &DB) -> eyre::Result<Option<Tip>> {
     db.get(TIP_KEY)?.map(|v| decode_tip(&v)).transpose()
+}
+
+fn layout_error(found: &str) -> eyre::Report {
+    eyre::eyre!(
+        "index layout: {found}, but this build reads version {LAYOUT} -- the index is \
+         derived data, so delete it and let the node rebuild",
+    )
+}
+
+/// Stamp a new index with [`LAYOUT`], and refuse one written by anything else.
+///
+/// An absent key means two opposite things: an index this call just created, or one
+/// older than the key. [`untouched`] tells them apart.
+fn check_layout(db: &DB) -> eyre::Result<()> {
+    let Some(stored) = db.get(LAYOUT_KEY)? else {
+        if !untouched(db)? {
+            return Err(layout_error("written before the version key existed"));
+        }
+        db.put(LAYOUT_KEY, LAYOUT.to_be_bytes())?;
+        return Ok(());
+    };
+    let found: [u8; 4] = stored
+        .as_slice()
+        .try_into()
+        .map_err(|_| layout_error(&format!("{} bytes, not a version", stored.len())))?;
+    match u32::from_be_bytes(found) {
+        LAYOUT => Ok(()),
+        other => Err(layout_error(&format!("version {other}"))),
+    }
+}
+
+/// Nothing has ever been applied: no rows, and no tip.
+///
+/// Both, because a plan may carry either without the other — and reading an index that
+/// has history as a fresh one would stamp this build's version onto another's rows.
+fn untouched(db: &DB) -> eyre::Result<bool> {
+    let no_rows = db
+        .iterator_cf(cf(db, CF_PRIMARY), IteratorMode::Start)
+        .next()
+        .transpose()?
+        .is_none();
+    Ok(no_rows && read_tip(db)?.is_none())
 }
 
 /// One counter's value. Absent is zero: a counter is only written once something is
@@ -1286,19 +1347,16 @@ mod tests {
 
     #[test]
     fn a_row_that_is_not_whole_addresses_is_rejected() {
-        // The layout has changed twice and carries no version byte, so a stored row
-        // from an older one has to fail loudly rather than decode as a different
-        // transaction. Width is what catches it: addresses are fixed, so anything
+        // The layout key catches an older *index*; this catches a damaged *row* inside
+        // one that opened cleanly, which has to fail loudly rather than decode as a
+        // different transaction. Width catches it: addresses are fixed, so anything
         // left over is not a row this build wrote.
         let mut val = encode_row(&tx(1, 0, 0xaa, Some(0xbb), 2));
         val.pop();
         let err = decode_row(Position::new(1, 0), &val)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("deleted and rebuilt"),
-            "unhelpful error: {err}"
-        );
+        assert!(err.contains("rebuild"), "unhelpful error: {err}");
     }
 
     #[test]
@@ -2030,10 +2088,7 @@ mod tests {
         let err = decode_row(Position::new(1, 0), &val)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("deleted and rebuilt"),
-            "unhelpful error: {err}"
-        );
+        assert!(err.contains("rebuild"), "unhelpful error: {err}");
 
         // And a row too short for the address its flags promise.
         let mut val = encode_row(&tx(1, 0, 0xaa, None, 2));
@@ -2232,6 +2287,87 @@ mod tests {
         assert_eq!(store.indexed_tip().unwrap(), tip(3));
         store.apply(&plan(Some(2), vec![], tip(1))).unwrap();
         assert_eq!(store.indexed_tip().unwrap(), tip(1));
+    }
+
+    /// Write an index, close it, and hand back the path to open it at again — the only
+    /// way to reach the checks that run at open.
+    fn closed(prepare: impl FnOnce(&mut Store)) -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexer");
+        let mut store = Store::open(&path).unwrap();
+        prepare(&mut store);
+        (dir, path)
+    }
+
+    /// One row and a tip: an index with history, whatever its layout key says.
+    fn seed_one(store: &mut Store) {
+        store
+            .apply(&plan(None, vec![tx(1, 0, 0xaa, Some(0xbb), 2)], tip(1)))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_index_records_the_layout_it_was_written_with() {
+        let (_dir, path) = closed(seed_one);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.db.get(LAYOUT_KEY).unwrap().unwrap(),
+            LAYOUT.to_be_bytes(),
+        );
+    }
+
+    #[test]
+    fn an_index_from_another_layout_is_refused_at_open() {
+        let (_dir, path) = closed(|store| {
+            seed_one(store);
+            store
+                .db
+                .put(LAYOUT_KEY, (LAYOUT + 1).to_be_bytes())
+                .unwrap();
+        });
+        let err = Store::open(&path).unwrap_err().to_string();
+        assert!(err.contains("version 2"), "unhelpful error: {err}");
+        assert!(err.contains("rebuild"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_index_written_before_the_layout_key_is_refused_at_open() {
+        // What every build before this one wrote: rows and a tip, no version. The
+        // point of the key is that such an index is one error at open rather than a
+        // decode error on whichever query first happens to read a row.
+        let (_dir, path) = closed(|store| {
+            seed_one(store);
+            store.db.delete(LAYOUT_KEY).unwrap();
+        });
+        let err = Store::open(&path).unwrap_err().to_string();
+        assert!(err.contains("before the version key"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn only_an_untouched_index_is_stamped_rather_than_refused() {
+        // Both halves of the check. Refusing an index nothing has been applied to would
+        // make an unused `--indexer` unstartable; accepting one that holds rows but no
+        // tip would stamp this build's version onto another build's rows.
+        let (_fresh_dir, fresh) = closed(|store| store.db.delete(LAYOUT_KEY).unwrap());
+        Store::open(&fresh).unwrap();
+
+        let (_written_dir, written) = closed(|store| {
+            store
+                .apply(&plan(None, vec![tx(1, 0, 0xaa, Some(0xbb), 2)], None))
+                .unwrap();
+            store.db.delete(LAYOUT_KEY).unwrap();
+        });
+        assert!(Store::open(&written).is_err(), "rows are history too");
+    }
+
+    #[test]
+    fn a_layout_value_that_is_not_a_version_is_refused() {
+        let (_dir, path) = closed(|store| {
+            seed_one(store);
+            store.db.put(LAYOUT_KEY, b"1").unwrap();
+        });
+        let err = Store::open(&path).unwrap_err().to_string();
+        assert!(err.contains("not a version"), "unhelpful error: {err}");
     }
 
     #[test]
