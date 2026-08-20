@@ -90,6 +90,18 @@ look-ahead row to decide whether another page exists, and a cursor cut from the 
 *returned*. Each is a way to silently truncate a walk, so they live here rather than in
 each caller.
 
+## What the index is holding
+
+```rust
+let stats = store.reader().stats()?;  // tip, row count, bytes per keyspace
+```
+
+On `Reader` because it only reads. There is no `compact`: RocksDB's own compaction
+already reclaims what this store leaves behind, and the two chains using it finalize, so
+a revert reaches only as deep as the unfinalized head — a handful of scattered tombstones,
+not a rewrite worth blocking a node for. `Stats::bytes` reports *file* bytes, which run
+ahead of what is reachable until that automatic compaction catches up.
+
 ## Tests
 
 `cargo test` — the keyspace layout, cursor round-tripping, filter intersection, paging,

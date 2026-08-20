@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, TxHash, B256};
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBIteratorWithThreadMode, Direction, IteratorMode,
-    Options, Snapshot, WriteBatch, DB,
+    properties, ColumnFamily, ColumnFamilyDescriptor, DBIteratorWithThreadMode, Direction,
+    IteratorMode, Options, Snapshot, WriteBatch, DB,
 };
 
 /// Ordering direction for a query, mirroring the RPC's `sort.order`.
@@ -570,6 +570,51 @@ impl Store {
     }
 }
 
+/// What the index is holding and where it stands — an operator's view, not a query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// The block the index is caught up to; `None` before the first apply.
+    pub tip: Option<Tip>,
+    /// Rows in the primary keyspace, from the counter `apply` maintains — exact, and
+    /// the same number a filterless [`Reader::count`] gives.
+    pub rows: u64,
+    /// SST bytes per keyspace, in layout order — what the index costs on disk.
+    ///
+    /// File bytes rather than live ones, so this runs ahead of what is reachable:
+    /// `count` is read-modify-write, and overwritten counters occupy their files until
+    /// RocksDB compacts them away on its own. A keyspace still entirely in a memtable
+    /// reports zero.
+    pub keyspaces: Vec<(&'static str, u64)>,
+}
+
+impl Stats {
+    /// Every keyspace's bytes together.
+    pub fn bytes(&self) -> u64 {
+        self.keyspaces.iter().map(|(_, bytes)| bytes).sum()
+    }
+}
+
+impl Reader {
+    /// What the index is holding and where it stands. See [`Stats`].
+    pub fn stats(&self) -> eyre::Result<Stats> {
+        let keyspaces = CFS
+            .iter()
+            .map(|&name| {
+                let bytes = self
+                    .db
+                    .property_int_value_cf(cf(&self.db, name), properties::TOTAL_SST_FILES_SIZE)?
+                    .unwrap_or(0);
+                Ok((name, bytes))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        Ok(Stats {
+            tip: read_tip(&self.db)?,
+            rows: read_count(&self.db, &count_key(COUNT_TOTAL, &[]))?,
+            keyspaces,
+        })
+    }
+}
+
 impl Reader {
     /// Page through the index. `after` is exclusive and read in `order`'s direction,
     /// so paging forward never repeats or skips a row. Returns at most `limit` rows.
@@ -672,16 +717,7 @@ impl Reader {
             // An intersection: each side is counted, their overlap is not.
             _ => return Ok(None),
         };
-        let stored = self.db.get_cf(cf(&self.db, CF_COUNT), key)?;
-        // Absent is zero: a counter is only written once something is counted, and
-        // deleted again when it falls back to nothing.
-        Ok(Some(
-            stored
-                .as_deref()
-                .map(decode_count)
-                .transpose()?
-                .unwrap_or(0),
-        ))
+        Ok(Some(read_count(&self.db, &key)?))
     }
 }
 
@@ -751,6 +787,17 @@ fn cf<'a>(db: &'a DB, name: &str) -> &'a ColumnFamily {
 
 fn read_tip(db: &DB) -> eyre::Result<Option<Tip>> {
     db.get(TIP_KEY)?.map(|v| decode_tip(&v)).transpose()
+}
+
+/// One counter's value. Absent is zero: a counter is only written once something is
+/// counted, and deleted again when it falls back to nothing.
+fn read_count(db: &DB, key: &[u8]) -> eyre::Result<u64> {
+    Ok(db
+        .get_cf(cf(db, CF_COUNT), key)?
+        .as_deref()
+        .map(decode_count)
+        .transpose()?
+        .unwrap_or(0))
 }
 
 /// How many entries a merge steps toward the other side before seeking straight to
@@ -2188,6 +2235,41 @@ mod tests {
     }
 
     #[test]
+    fn stats_follow_the_rows_and_the_tip() {
+        let (_dir, mut store) = seeded();
+        let ops = store.reader();
+
+        let stats = ops.stats().unwrap();
+        assert_eq!(stats.rows, 4);
+        assert_eq!(stats.tip, tip(3));
+        let named: Vec<&str> = stats.keyspaces.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            named, CFS,
+            "a keyspace absent from stats is one nobody sizes"
+        );
+
+        store.apply(&plan(Some(2), vec![], tip(1))).unwrap();
+        let stats = ops.stats().unwrap();
+        assert_eq!(stats.rows, 2, "a revert discounts what it dropped");
+        assert_eq!(stats.tip, tip(1));
+    }
+
+    #[test]
+    fn stats_count_rows_rather_than_index_entries() {
+        // One row, three secondary entries, four counters. `rows` is the primary's,
+        // which is the number an operator sizing a rebuild is asking for.
+        let (_dir, mut store) = empty();
+        store
+            .apply(&plan(
+                None,
+                vec![batch(1, 0, 0xaa, &[0xbb, 0xcc], 2)],
+                tip(1),
+            ))
+            .unwrap();
+        assert_eq!(store.reader().stats().unwrap().rows, 1);
+    }
+
+    #[test]
     fn reader_sees_the_writers_commits() {
         // "Cannot write" needs no runtime test: `Reader` has no write methods, so it
         // is a compile error instead.
@@ -2201,6 +2283,13 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(read_tip(&reader.db).unwrap(), tip(1));
+
+        // Including the operator's view: the handle is taken at the launch site, before
+        // the store moves into the ExEx, so one reporting the index as it stood when
+        // taken would answer zero forever.
+        let stats = reader.stats().unwrap();
+        assert_eq!(stats.rows, 1);
+        assert_eq!(stats.tip, tip(1));
     }
 
     #[test]
